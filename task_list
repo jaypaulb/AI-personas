@@ -33,12 +33,12 @@ This project is a GoLang application that integrates with the Canvus API (MCS) a
 ## 1. Project Structure & Setup
 - [x] Create .gitignore for Go
 - [x] Initialize GitHub repo and push initial commit
-- [ ] Create directories: /cmd, /internal, /pkg, /test
-- [ ] Add README.md with project overview and setup instructions
+- [x] Create directories: /cmd, /internal, /pkg, /test
+- [x] Add README.md with project overview and setup instructions
 
 ## 2. Canvus API Integration
 - [x] Validate canvusapi.go client
-- [ ] Add wrapper for widget event subscription and parsing
+- [~] Add wrapper for widget event subscription and parsing (scaffolded, in progress)
 - [ ] Implement widget trigger detection logic
 
 ## 3. Gemini GenAI Integration
