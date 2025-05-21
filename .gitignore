@@ -26,10 +26,4 @@
 Thumbs.db
 
 # Env files
-.env
-
-# Logs
-*.log
-
-# Test binary
-*.test 
+.env 
