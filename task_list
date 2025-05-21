@@ -35,6 +35,7 @@ This project is a GoLang application that integrates with the Canvus API (MCS) a
 - [x] Initialize GitHub repo and push initial commit
 - [x] Create directories: /cmd, /internal, /pkg, /test
 - [x] Add README.md with project overview and setup instructions
+- [x] Load .env file in both app and tests
 
 ## 2. Canvus API Integration
 - [x] Validate canvusapi.go client

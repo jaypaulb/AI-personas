@@ -10,6 +10,7 @@ import (
 
 	"github.com/jaypaulb/AI-personas/canvusapi"
 	"github.com/jaypaulb/AI-personas/internal/canvus"
+	"github.com/joho/godotenv"
 )
 
 func TestCanvusEventMonitor_Integration(t *testing.T) {
@@ -17,6 +18,13 @@ func TestCanvusEventMonitor_Integration(t *testing.T) {
 	t.Logf("Current working directory: %s", cwd)
 
 	envPath := filepath.Join(cwd, ".env")
+	err := godotenv.Load(envPath)
+	if err != nil {
+		t.Logf("Could not load .env file: %v", err)
+	} else {
+		t.Logf("Loaded .env file: %s", envPath)
+	}
+
 	if _, err := os.Stat(envPath); err == nil {
 		content, err := ioutil.ReadFile(envPath)
 		if err == nil {

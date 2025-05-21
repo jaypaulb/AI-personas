@@ -9,9 +9,12 @@ import (
 
 	"github.com/jaypaulb/AI-personas/canvusapi"
 	"github.com/jaypaulb/AI-personas/internal/canvus"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	_ = godotenv.Load()
+
 	client, err := canvusapi.NewClientFromEnv()
 	if err != nil {
 		log.Fatalf("Failed to initialize Canvus client: %v", err)
