@@ -2,7 +2,9 @@ package test
 
 import (
 	"context"
+	"io/ioutil"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,6 +13,25 @@ import (
 )
 
 func TestCanvusEventMonitor_Integration(t *testing.T) {
+	cwd, _ := os.Getwd()
+	t.Logf("Current working directory: %s", cwd)
+
+	envPath := filepath.Join(cwd, ".env")
+	if _, err := os.Stat(envPath); err == nil {
+		content, err := ioutil.ReadFile(envPath)
+		if err == nil {
+			t.Logf(".env file contents:\n%s", string(content))
+		} else {
+			t.Logf("Could not read .env file: %v", err)
+		}
+	} else {
+		t.Logf(".env file not found at: %s", envPath)
+	}
+
+	t.Logf("CANVUS_API_KEY: %q", os.Getenv("CANVUS_API_KEY"))
+	t.Logf("CANVUS_SERVER: %q", os.Getenv("CANVUS_SERVER"))
+	t.Logf("CANVAS_ID: %q", os.Getenv("CANVAS_ID"))
+
 	if os.Getenv("CANVUS_API_KEY") == "" || os.Getenv("CANVUS_SERVER") == "" || os.Getenv("CANVAS_ID") == "" {
 		t.Skip("Skipping integration test: CANVUS_API_KEY, CANVUS_SERVER, or CANVAS_ID not set")
 	}
