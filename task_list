@@ -39,7 +39,8 @@ This project is a GoLang application that integrates with the Canvus API (MCS) a
 ## 2. Canvus API Integration
 - [x] Validate canvusapi.go client
 - [x] Add wrapper for widget event subscription and parsing
-- [~] Implement widget trigger detection logic (in progress)
+- [x] Implement widget trigger detection logic
+- [~] Integration test for Canvus event monitor (in progress)
 
 ## 3. Gemini GenAI Integration
 - [ ] Implement Gemini text client for persona generation and Q&A
