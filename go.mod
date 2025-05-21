@@ -1,3 +1,3 @@
-module github.com/jaypa/AI-personas
+module github.com/jaypaulb/AI-personas
 
 go 1.24.1
