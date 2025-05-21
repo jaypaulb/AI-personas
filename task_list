@@ -1,0 +1,75 @@
+# Project Scope
+
+This project is a GoLang application that integrates with the Canvus API (MCS) and Google Gemini GenAI models to automate persona-driven focus group analysis and Q&A workflows on a business canvas. The app will:
+- Monitor a Canvus canvas for specific widget triggers (image and note creation/updates)
+- Extract business model data from notes
+- Use Gemini GenAI to generate diverse personas and simulate focus group sessions
+- Persist persona sessions for ongoing Q&A
+- Visualize persona responses and meta-responses on the canvas using notes and connectors
+
+# Development Plan
+
+## Architecture
+- Modular Go application with clear separation between:
+  - Canvus API client (already present)
+  - Gemini GenAI client (to be implemented)
+  - Event monitoring and trigger logic
+  - Persona/session management
+  - Canvas visualization logic
+- Use environment variables for configuration (.env)
+- Use Go modules for dependency management
+- Ensure robust error handling and logging
+
+## Methods & Approaches
+- Use Go routines and channels for concurrent widget monitoring and event handling
+- Use context.Context for cancellation and timeouts
+- Use a persistent store (in-memory or file-based) for persona session state
+- Use color assignment logic for persona notes
+- Use the official Gemini API (or REST if no Go SDK) for text and image generation
+- Write unit and integration tests for all major components
+
+# Task List
+
+## 1. Project Structure & Setup
+- [x] Create .gitignore for Go
+- [x] Initialize GitHub repo and push initial commit
+- [ ] Create directories: /cmd, /internal, /pkg, /test
+- [ ] Add README.md with project overview and setup instructions
+
+## 2. Canvus API Integration
+- [x] Validate canvusapi.go client
+- [ ] Add wrapper for widget event subscription and parsing
+- [ ] Implement widget trigger detection logic
+
+## 3. Gemini GenAI Integration
+- [ ] Implement Gemini text client for persona generation and Q&A
+- [ ] Implement Gemini image client for persona avatars
+- [ ] Add session management for persistent persona conversations
+
+## 4. Business Canvas Data Extraction
+- [ ] Implement extraction of business model data from notes
+- [ ] Validate extraction with test data
+
+## 5. Persona Generation & Management
+- [ ] Implement persona generation workflow (4 diverse personas)
+- [ ] Assign unique colors and anchor positions
+- [ ] Create persona notes in anchor zone (index 2)
+- [ ] Persist persona sessions
+
+## 6. Question Handling Workflow
+- [ ] Monitor for New_AI_Question notes
+- [ ] Implement question activation and monitoring logic
+- [ ] Trigger persona Q&A and meta-response workflow
+- [ ] Visualize responses and connectors in 3x3 grid
+
+## 7. Testing & Validation
+- [ ] Write unit tests for all modules
+- [ ] Write integration tests for end-to-end flows
+- [ ] Manual validation with MCS test canvas
+
+## 8. Documentation
+- [ ] Document all modules and workflows
+- [ ] Update README with usage and contribution guidelines
+
+## 9. CI/CD (Optional)
+- [ ] Add GitHub Actions for linting, testing, and build 
