@@ -1,6 +1,21 @@
-# AI Personas
+# AI-Personas
 
-A GoLang application that integrates with the Canvus API (MCS) and Google Gemini GenAI to automate persona-driven focus group analysis and Q&A workflows on a business canvas.
+This project implements a robust persona-driven Q&A workflow for Canvus canvases, integrating Google Gemini GenAI and OpenAI. Key features:
+
+- **Persona System Prompt:** Each persona LLM session is initialized with a detailed system prompt including business context and conversational instructions.
+- **Color Mapping:** All notes from a persona use a consistent color.
+- **Grid Layout:** Persona answers and meta answers are placed in a 3x3 grid around the user question, matching the intended UI.
+- **Connector Logic:** Connectors are created after all notes, linking question → answer and answer → meta answer.
+- **Overlap Handling:** The system automatically moves or scales notes to avoid overlap. If space cannot be found, the user is prompted to move the note.
+- **Succinct LLM Responses:** If a response is too long, the LLM is re-prompted for a more succinct, verbal answer.
+- **Robustness:** The workflow is robust to grid/canvas issues and prevents negative WaitGroup panics.
+
+## Usage
+
+1. Set up your `.env` with the required API keys.
+2. Run the main application. The system will monitor for new questions and generate persona-driven answers and meta answers in a visually organized, robust manner.
+
+See `task_list` for completed features and next steps.
 
 ## Features
 - Monitors a Canvus canvas for widget triggers (image/note creation)

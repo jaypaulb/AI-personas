@@ -103,10 +103,90 @@ func FormatPersonaNote(p Persona) string {
 	)
 }
 
-// AnswerQuestion answers a question as a persona (placeholder)
-func (c *Client) AnswerQuestion(ctx context.Context, persona string, question string) (string, error) {
-	// TODO: Implement Q&A using Gemini
-	return "", nil
+// PersonaSession holds a chat session and persona info
+// for multi-turn LLM conversations.
+type PersonaSession struct {
+	Persona *Persona
+	Chat    *genai.Chat
+}
+
+// SessionManager manages chat sessions for each persona.
+type SessionManager struct {
+	sessions map[string]*PersonaSession
+	client   *genai.Client
+}
+
+// NewSessionManager creates a new session manager.
+func NewSessionManager(client *genai.Client) *SessionManager {
+	return &SessionManager{
+		sessions: make(map[string]*PersonaSession),
+		client:   client,
+	}
+}
+
+// GenerateSystemPrompt returns a detailed system prompt for a persona
+func GenerateSystemPrompt(persona Persona, businessContext string) string {
+	return fmt.Sprintf(`Assume the role of the following persona for a business focus group. You are a client or potential client of the business. You are in a general purpose focus group for the business. Here is the business outline:
+
+%s
+
+Persona:
+Name: %s
+Role: %s
+Description: %s
+Background: %s
+Goals: %s
+Age: %s
+Sex: %s
+Race: %s
+
+When asked a question or provided with some info, you must only respond as the persona assigned and in the voice of that persona. Your responses should be short and sweet and structured as if given verbally. You should not repeat the question or reiterate points from the question as this would not be natural for a conversational style interaction verbally. Do not start your answer by restating the question. Do not use phrases like 'As a persona...' or 'If I were...'. Just answer as if you are the person.`,
+		businessContext,
+		persona.Name,
+		persona.Role,
+		persona.Description,
+		persona.Background,
+		persona.Goals,
+		persona.Age,
+		persona.Sex,
+		persona.Race,
+	)
+}
+
+// GetOrCreateSession returns the session for a persona, creating it if needed.
+func (sm *SessionManager) GetOrCreateSession(ctx context.Context, persona Persona, businessContext string) (*PersonaSession, error) {
+	if sess, ok := sm.sessions[persona.Name]; ok {
+		return sess, nil
+	}
+	chat, err := sm.client.Chats.Create(ctx, "gemini-1.5-flash", nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Inject system prompt as first message
+	systemPrompt := GenerateSystemPrompt(persona, businessContext)
+	_, _ = chat.Send(ctx, &genai.Part{Text: systemPrompt})
+	sess := &PersonaSession{
+		Persona: &persona,
+		Chat:    chat,
+	}
+	sm.sessions[persona.Name] = sess
+	return sess, nil
+}
+
+// AnswerQuestion answers a question as a persona, maintaining chat history.
+func (c *Client) AnswerQuestion(ctx context.Context, persona Persona, question string, sm *SessionManager, businessContext string) (string, error) {
+	sess, err := sm.GetOrCreateSession(ctx, persona, businessContext)
+	if err != nil {
+		return "", err
+	}
+	resp, err := sess.Chat.Send(ctx, &genai.Part{Text: question})
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) == 0 {
+		return "", fmt.Errorf("no response from Gemini")
+	}
+	return resp.Candidates[0].Content.Parts[0].Text, nil
 }
 
 // GeneratePersonaImage calls Imagen 3 to generate an avatar image for a persona

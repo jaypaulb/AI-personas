@@ -6,11 +6,20 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/jaypaulb/AI-personas/canvusapi"
 )
+
+var debugMode = false
+
+func init() {
+	if v := os.Getenv("DEBUG"); v == "1" {
+		debugMode = true
+	}
+}
 
 // WidgetEvent represents a widget event from the Canvus API
 // (expand as needed for event details)
@@ -81,14 +90,18 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 				log.Printf("[event] Skipping malformed line: %s", string(line))
 				continue // skip malformed lines
 			}
-			log.Printf("[event] %s", string(line)) // Log the raw event line
+			if debugMode {
+				log.Printf("[event] %s", string(line))
+			}
 			for _, raw := range events {
 				widType, _ := raw["widget_type"].(string)
 				id, _ := raw["id"].(string)
 				title, _ := raw["title"].(string)
 				text, _ := raw["text"].(string)
 
-				log.Printf("[debug] Checking event: widget_type=%q, title=%q", widType, title)
+				if debugMode {
+					log.Printf("[debug] Checking event: widget_type=%q, title=%q", widType, title)
+				}
 
 				widget := WidgetEvent{
 					ID:    id,
@@ -109,9 +122,13 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 
 				// Detect New_AI_Question note creation
 				if widType == "Note" && strings.EqualFold(title, "New_AI_Question") {
-					jsonRaw, _ := json.MarshalIndent(raw, "", "  ")
-					log.Printf("[trigger] New_AI_Question detected:\n%s\n", string(jsonRaw))
-					triggers <- EventTrigger{Type: TriggerNewAIQuestion, Widget: widget}
+					bg, _ := raw["background_color"].(string)
+					bgLower := strings.ToLower(strings.TrimSpace(bg))
+					if bgLower == "#ffffffff" || bgLower == "#ffffff" {
+						jsonRaw, _ := json.MarshalIndent(raw, "", "  ")
+						log.Printf("[trigger] New_AI_Question detected:\n%s\n", string(jsonRaw))
+						triggers <- EventTrigger{Type: TriggerNewAIQuestion, Widget: widget}
+					}
 					continue
 				}
 			}
