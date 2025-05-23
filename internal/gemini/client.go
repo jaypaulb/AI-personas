@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 	"google.golang.org/genai"
@@ -150,42 +152,72 @@ func GeneratePersonaImageOpenAI(persona Persona) ([]byte, error) {
 		"size":   "512x512",
 	}
 	jsonBody, _ := json.Marshal(body)
-	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("Failed to create OpenAI request: %w", err)
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
+		if err != nil {
+			return nil, fmt.Errorf("Failed to create OpenAI request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("OpenAI HTTP request failed: %w", err)
+			log.Printf("[warn] OpenAI image gen attempt %d failed: %v", attempt, lastErr)
+			if attempt < 3 {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			break
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
+			lastErr = fmt.Errorf("OpenAI API server error: %s", string(respBody))
+			log.Printf("[warn] OpenAI image gen attempt %d got server error: %s", attempt, string(respBody))
+			if attempt < 3 {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			break
+		}
+		if resp.StatusCode != 200 {
+			lastErr = fmt.Errorf("OpenAI API error: %s", string(respBody))
+			// Only retry on explicit 'server_error' type
+			if bytes.Contains(respBody, []byte("server_error")) && attempt < 3 {
+				log.Printf("[warn] OpenAI image gen attempt %d got server_error, retrying", attempt)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			break
+		}
+		var parsed struct {
+			Data []struct {
+				URL string `json:"url"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(respBody, &parsed); err != nil {
+			lastErr = fmt.Errorf("Failed to parse OpenAI response: %w", err)
+			break
+		}
+		if len(parsed.Data) == 0 || parsed.Data[0].URL == "" {
+			lastErr = fmt.Errorf("No image URL returned from OpenAI")
+			break
+		}
+		imgResp, err := http.Get(parsed.Data[0].URL)
+		if err != nil {
+			lastErr = fmt.Errorf("Failed to download image: %w", err)
+			break
+		}
+		defer imgResp.Body.Close()
+		imgBytes, err := io.ReadAll(imgResp.Body)
+		if err != nil {
+			lastErr = fmt.Errorf("Failed to read image data: %w", err)
+			break
+		}
+		return imgBytes, nil
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("OpenAI HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("OpenAI API error: %s", string(respBody))
-	}
-	var parsed struct {
-		Data []struct {
-			URL string `json:"url"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, fmt.Errorf("Failed to parse OpenAI response: %w", err)
-	}
-	if len(parsed.Data) == 0 || parsed.Data[0].URL == "" {
-		return nil, fmt.Errorf("No image URL returned from OpenAI")
-	}
-	imgResp, err := http.Get(parsed.Data[0].URL)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to download image: %w", err)
-	}
-	defer imgResp.Body.Close()
-	imgBytes, err := io.ReadAll(imgResp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to read image data: %w", err)
-	}
-	return imgBytes, nil
+	return nil, lastErr
 }
 
 func (c *Client) GenaiClient() *genai.Client {
