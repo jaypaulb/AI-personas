@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -462,7 +463,8 @@ func (c *Client) downloadFile(endpoint string, outputPath string) error {
 
 // SubscribeToWidgets creates a subscription to the widgets stream
 func (c *Client) SubscribeToWidgets(ctx context.Context) (io.ReadCloser, error) {
-	url := fmt.Sprintf("%s/api/v1/canvases/%s/widgets?subscribe", c.Server, c.CanvasID)
+	url := fmt.Sprintf("%s/api/v1/canvases/%s/widgets?subscribe", strings.TrimRight(c.Server, "/"), c.CanvasID)
+	log.Printf("[debug] Subscribing to widgets at URL: %s", url)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {

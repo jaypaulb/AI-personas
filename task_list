@@ -12,7 +12,7 @@ This project is a GoLang application that integrates with the Canvus API (MCS) a
 ## Architecture
 - Modular Go application with clear separation between:
   - Canvus API client (already present)
-  - Gemini GenAI client (to be implemented)
+  - Gemini GenAI client (implemented for text; OpenAI DALL·E used for images)
   - Event monitoring and trigger logic
   - Persona/session management
   - Canvas visualization logic
@@ -25,7 +25,7 @@ This project is a GoLang application that integrates with the Canvus API (MCS) a
 - Use context.Context for cancellation and timeouts
 - Use a persistent store (in-memory or file-based) for persona session state
 - Use color assignment logic for persona notes
-- Use the official Gemini API (or REST if no Go SDK) for text and image generation
+- Use the official Gemini API for text (OpenAI DALL·E for image generation)
 - Write unit and integration tests for all major components
 
 # Task List
@@ -44,18 +44,18 @@ This project is a GoLang application that integrates with the Canvus API (MCS) a
 - [x] Integration test for Canvus event monitor (fully automated)
 
 ## 3. Gemini GenAI Integration
-- [ ] Implement Gemini text client for persona generation and Q&A
-- [ ] Implement Gemini image client for persona avatars
+- [x] Implement Gemini text client for persona generation and Q&A
+- [x] Implement OpenAI DALL·E image client for persona avatars (Gemini image API not available/region-locked)
 - [ ] Add session management for persistent persona conversations
 
 ## 4. Business Canvas Data Extraction
-- [ ] Implement extraction of business model data from notes
-- [ ] Validate extraction with test data
+- [x] Implement extraction of business model data from notes
+- [x] Validate extraction with test data
 
 ## 5. Persona Generation & Management
-- [ ] Implement persona generation workflow (4 diverse personas)
-- [ ] Assign unique colors and anchor positions
-- [ ] Create persona notes in anchor zone (index 2)
+- [x] Implement persona generation workflow (4 diverse personas)
+- [x] Assign unique colors and anchor positions
+- [x] Create persona notes in anchor zone (index 2)
 - [ ] Persist persona sessions
 
 ## 6. Question Handling Workflow
@@ -75,3 +75,6 @@ This project is a GoLang application that integrates with the Canvus API (MCS) a
 
 ## 9. CI/CD (Optional)
 - [ ] Add GitHub Actions for linting, testing, and build 
+
+# Note
+- Image generation uses OpenAI DALL·E due to Gemini API limitations in your region/account. 
