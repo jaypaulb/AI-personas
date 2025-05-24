@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,7 +71,19 @@ Business Context:
 ` + businessContext
 
 	model := "gemini-1.5-flash" // or your preferred model
-	resp, err := c.genai.Models.GenerateContent(ctx, model, []*genai.Content{{Parts: []*genai.Part{{Text: prompt}}}}, nil)
+
+	// Read temperature from env
+	temp := 0.7
+	if v := os.Getenv("LLM_TEMP"); v != "" {
+		if f, err := strconv.ParseFloat(v, 32); err == nil {
+			temp = f
+		}
+	}
+	config := &genai.GenerateContentConfig{
+		Temperature: float32(temp),
+	}
+
+	resp, err := c.genai.Models.GenerateContent(ctx, model, []*genai.Content{{Parts: []*genai.Part{{Text: prompt}}}}, config)
 	if err != nil {
 		return nil, err
 	}
