@@ -130,263 +130,245 @@ func main() {
 	for {
 		select {
 		case trig := <-triggers:
-			// Flexible BAC_Complete image trigger (case-insensitive, ignores .png)
-			imageTitle := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(trig.Widget.Title), ".png"))
-			if trig.Widget.Type == "Image" && imageTitle == "bac_complete" && !imagePatched {
-				imageID = trig.Widget.ID
-				logutil.Debugf("\n\nImage Trigger - BAC Completed @ Loc Proceeding with Data Extraction\n\n")
-				// Add a short delay to avoid race condition with backend
-				time.Sleep(2 * time.Second)
-				update := map[string]interface{}{"title": "BAC_Complete_Monitoring"}
-				logutil.Debugf("[debug] UpdateImage payload: %v", update)
-				resp, err := client.UpdateImage(imageID, update)
-				respJSON, _ := json.MarshalIndent(resp, "", "  ")
-				logutil.Debugf("[action] UpdateImage (to _Monitoring) response:\n%s\nerr: %v\n", string(respJSON), err)
-				// Fetch the image after update
-				fetched, fetchErr := client.GetImage(imageID, false)
-				if fetchErr != nil {
-					logutil.Debugf("[debug] Error fetching image after update: %v", fetchErr)
-				} else {
-					title, _ := fetched["title"].(string)
-					logutil.Debugf("[debug] Image title after update (fetched): %q", title)
-				}
-				imagePatched = true
-				// Start a goroutine to reset imagePatched after 60 seconds
-				go func() {
-					time.Sleep(60 * time.Second)
-					imagePatched = false
-					logutil.Infof("[info] imagePatched reset after timeout, ready for next BAC_Complete trigger\n")
-				}()
-
-				// Call the new helper function
-				err = gemini.CreatePersonas(ctx, client)
+			switch trig.Type {
+			case canvus.TriggerCreatePersonasNote:
+				logutil.Debugf("\n\nTrigger - Create_Personas Note detected. Proceeding with Persona Creation.\n\n")
+				err := gemini.CreatePersonas(ctx, client)
 				if err != nil {
 					logutil.Errorf("[error] CreatePersonas failed: %v\n", err)
-				}
-			}
-			if trig.Widget.Type == "Note" && trig.Widget.Title == "New_AI_Question" && !noteMonitors[trig.Widget.ID] {
-				noteID = trig.Widget.ID
-				logutil.Debugf("[trigger] New_AI_Question detected, ID: %s\n", noteID)
-				// Prepend monitoring message and set pastel red
-				origText := trig.Widget.Text
-				newText := "I'm Monitoring this note please add your question below -->\n" + origText
-				update := map[string]interface{}{
-					"text":             newText,
-					"background_color": "#ffcccc",
-				}
-				logutil.Infof("[action] Attempting to update note for monitoring: payload=%v", update)
-				resp, err := client.UpdateNote(noteID, update)
-				respJSON, _ := json.MarshalIndent(resp, "", "  ")
-				if err != nil {
-					logutil.Errorf("[action] UpdateNote (to monitoring) error: %v", err)
 				} else {
-					logutil.Infof("[action] UpdateNote (to monitoring) response: %s", string(respJSON))
+					// Delete the Create_Personas note after successful persona creation
+					if err := client.DeleteNote(trig.Widget.ID); err != nil {
+						logutil.Errorf("[error] Failed to delete Create_Personas note: %v\n", err)
+					} else {
+						logutil.Infof("[action] Deleted Create_Personas note (ID: %s) after persona creation.", trig.Widget.ID)
+					}
 				}
-				notePatched = true
-				noteMonitors[noteID] = true
-				// Gather context for Q&A workflow
-				ctx2, cancel2 := context.WithTimeout(context.Background(), 60*time.Second)
-				defer cancel2()
-				geminiClient, err := gemini.NewClient(ctx2)
-				if err != nil {
-					logutil.Errorf("[error] Failed to create Gemini client: %v\n", err)
-					continue
-				}
-				personas, err := geminiClient.GeneratePersonas(ctx2, "Q&A context")
-				if err != nil {
-					logutil.Errorf("[error] Gemini persona generation failed: %v\n", err)
-					continue
-				}
-				colors := []string{"#2196f3ff", "#4caf50ff", "#ff9800ff", "#9c27b0ff"}
-				qWidget, _ := client.GetNote(noteID, false)
-				// Fetch Qnote (question note) location and size
-				qLoc, _ := qWidget["location"].(map[string]interface{})
-				qSize, _ := qWidget["size"].(map[string]interface{})
-				qx := qLoc["x"].(float64)
-				qy := qLoc["y"].(float64)
-				qw := qSize["width"].(float64)
-				qh := qSize["height"].(float64)
-				sessionManager := gemini.NewSessionManager(geminiClient.GenaiClient())
-				// Start the note monitor goroutine with all required context
-				wg.Add(1)
-				go func(noteID string, noteTextExtracted *string, imageID *string, personas []gemini.Persona, colors []string, qx, qy, qw, qh float64, geminiClient *gemini.Client, sessionManager *gemini.SessionManager, businessContext string) {
-					defer wg.Done()
+			case canvus.TriggerNewAIQuestion:
+				if !noteMonitors[trig.Widget.ID] {
+					noteID = trig.Widget.ID
+					logutil.Debugf("[trigger] New_AI_Question detected, ID: %s\n", noteID)
+					// Prepend monitoring message and set pastel red
+					origText := trig.Widget.Text
+					newText := "I'm Monitoring this note please add your question below -->\n" + origText
+					update := map[string]interface{}{
+						"text":             newText,
+						"background_color": "#ffcccc",
+					}
+					logutil.Infof("[action] Attempting to update note for monitoring: payload=%v", update)
+					resp, err := client.UpdateNote(noteID, update)
+					respJSON, _ := json.MarshalIndent(resp, "", "  ")
+					if err != nil {
+						logutil.Errorf("[action] UpdateNote (to monitoring) error: %v", err)
+					} else {
+						logutil.Infof("[action] UpdateNote (to monitoring) response: %s", string(respJSON))
+					}
+					notePatched = true
+					noteMonitors[noteID] = true
+					// Gather context for Q&A workflow
 					ctx2, cancel2 := context.WithTimeout(context.Background(), 60*time.Second)
 					defer cancel2()
-					server := strings.TrimRight(client.Server, "/")
-					url := fmt.Sprintf("%s/api/v1/canvases/%s/notes/%s?subscribe", server, client.CanvasID, noteID)
-					logutil.Infof("[note-monitor] Starting note monitor for ID: %s at URL: %s\n", noteID, url)
-					req, err := http.NewRequestWithContext(ctx2, "GET", url, nil)
+					geminiClient, err := gemini.NewClient(ctx2)
 					if err != nil {
-						logutil.Warnf("[note-monitor] Failed to create request: %v\n", err)
-						return
+						logutil.Errorf("[error] Failed to create Gemini client: %v\n", err)
+						continue
 					}
-					req.Header.Set("Private-Token", client.ApiKey)
-					resp, err := client.HTTP.Do(req)
+					personas, err := geminiClient.GeneratePersonas(ctx2, "Q&A context")
 					if err != nil {
-						logutil.Warnf("[note-monitor] Failed to connect to stream: %v\n", err)
-						return
+						logutil.Errorf("[error] Gemini persona generation failed: %v\n", err)
+						continue
 					}
-					defer resp.Body.Close()
-					r := bufio.NewReader(resp.Body)
-					var lastText string
-					var timer *time.Timer
-					for {
-						select {
-						case <-ctx2.Done():
-							logutil.Infof("[note-monitor] Context done for note monitor\n")
+					colors := []string{"#2196f3ff", "#4caf50ff", "#ff9800ff", "#9c27b0ff"}
+					qWidget, _ := client.GetNote(noteID, false)
+					// Fetch Qnote (question note) location and size
+					qLoc, _ := qWidget["location"].(map[string]interface{})
+					qSize, _ := qWidget["size"].(map[string]interface{})
+					qx := qLoc["x"].(float64)
+					qy := qLoc["y"].(float64)
+					qw := qSize["width"].(float64)
+					qh := qSize["height"].(float64)
+					sessionManager := gemini.NewSessionManager(geminiClient.GenaiClient())
+					// Start the note monitor goroutine with all required context
+					wg.Add(1)
+					go func(noteID string, noteTextExtracted *string, imageID *string, personas []gemini.Persona, colors []string, qx, qy, qw, qh float64, geminiClient *gemini.Client, sessionManager *gemini.SessionManager, businessContext string) {
+						defer wg.Done()
+						ctx2, cancel2 := context.WithTimeout(context.Background(), 60*time.Second)
+						defer cancel2()
+						server := strings.TrimRight(client.Server, "/")
+						url := fmt.Sprintf("%s/api/v1/canvases/%s/notes/%s?subscribe", server, client.CanvasID, noteID)
+						logutil.Infof("[note-monitor] Starting note monitor for ID: %s at URL: %s\n", noteID, url)
+						req, err := http.NewRequestWithContext(ctx2, "GET", url, nil)
+						if err != nil {
+							logutil.Warnf("[note-monitor] Failed to create request: %v\n", err)
 							return
-						default:
-							line, err := r.ReadBytes('\n')
-							if err != nil {
-								if err.Error() == "EOF" {
-									logutil.Infof("[note-monitor] EOF on note event stream, sleeping...\n")
-									time.Sleep(1 * time.Second)
+						}
+						req.Header.Set("Private-Token", client.ApiKey)
+						resp, err := client.HTTP.Do(req)
+						if err != nil {
+							logutil.Warnf("[note-monitor] Failed to connect to stream: %v\n", err)
+							return
+						}
+						defer resp.Body.Close()
+						r := bufio.NewReader(resp.Body)
+						var lastText string
+						var timer *time.Timer
+						for {
+							select {
+							case <-ctx2.Done():
+								logutil.Infof("[note-monitor] Context done for note monitor\n")
+								return
+							default:
+								line, err := r.ReadBytes('\n')
+								if err != nil {
+									if err.Error() == "EOF" {
+										logutil.Infof("[note-monitor] EOF on note event stream, sleeping...\n")
+										time.Sleep(1 * time.Second)
+										continue
+									}
+									logutil.Errorf("[note-monitor] Error reading note event stream: %v\n", err)
+									return
+								}
+								var raw map[string]interface{}
+								if err := json.Unmarshal(line, &raw); err != nil {
 									continue
 								}
-								logutil.Errorf("[note-monitor] Error reading note event stream: %v\n", err)
-								return
-							}
-							var raw map[string]interface{}
-							if err := json.Unmarshal(line, &raw); err != nil {
-								continue
-							}
-							text, _ := raw["text"].(string)
-							trimmedText := strings.TrimSpace(text)
-							if strings.HasSuffix(trimmedText, "?") {
-								if lastText != trimmedText {
-									lastText = trimmedText
-									if timer != nil {
-										timer.Stop()
-									}
-									timer = time.AfterFunc(3*time.Second, func() {
-										logutil.Infof("[note-monitor] 3 seconds of inactivity after '?' detected. Proceeding to _Answering.\n")
-										// Append answering message and set pastel amber
-										fetched, err := client.GetNote(noteID, false)
-										var currText string
-										if err == nil {
-											currText, _ = fetched["text"].(string)
+								text, _ := raw["text"].(string)
+								trimmedText := strings.TrimSpace(text)
+								if strings.HasSuffix(trimmedText, "?") {
+									if lastText != trimmedText {
+										lastText = trimmedText
+										if timer != nil {
+											timer.Stop()
 										}
-										newText := currText + "\nPlease wait - answering."
-										updateText := map[string]interface{}{
-											"text":             newText,
-											"background_color": "#ffe4b3",
-										}
-										logutil.Infof("[note-monitor] Attempting to update note for answering: payload=%v", updateText)
-										resp, err := client.UpdateNote(noteID, updateText)
-										respJSON, _ := json.MarshalIndent(resp, "", "  ")
-										if err != nil {
-											logutil.Errorf("[note-monitor] UpdateNote (to answering) error: %v", err)
-										} else {
-											logutil.Infof("[note-monitor] UpdateNote (to answering) response: %s", string(respJSON))
-										}
-										// --- Persona Q&A Workflow ---
-										// 1. Extract the user's question (strip monitoring/answering messages)
-										question := currText
-										if idx := strings.Index(question, "-->"); idx != -1 {
-											question = question[idx+3:]
-										}
-										question = strings.TrimSpace(strings.Split(question, "Please wait")[0])
-										// Define grid positions for 4 personas: top, right, bottom, left (answers); top-right, bottom-right, bottom-left, top-left (meta answers)
-										gridPositions := [][2]float64{
-											{0, -1},  // top (Persona 1 Answer)
-											{1, 0},   // right (Persona 2 Answer)
-											{0, 1},   // bottom (Persona 3 Answer)
-											{-1, 0},  // left (Persona 4 Answer)
-											{1, -1},  // top-right (Persona 2 Meta)
-											{1, 1},   // bottom-right (Persona 3 Meta)
-											{-1, 1},  // bottom-left (Persona 4 Meta)
-											{-1, -1}, // top-left (Persona 1 Meta)
-										}
-										answerNoteIDs := make([]string, 4)
-										metaNoteIDs := make([]string, 4)
-										// 1. Create answer notes in cardinal directions
-										for i, p := range personas {
-											pos := gridPositions[i]
-											ansX := qx + pos[0]*qw
-											ansY := qy + pos[1]*qh
-											answer, _ := geminiClient.AnswerQuestion(ctx, p, question, sessionManager, businessContext)
-											if len(answer) > chatTokenLimit {
-												succinctPrompt := "Please rephrase your answer in a much more succinct, short, and verbal way. Limit your response to " + fmt.Sprintf("%d", chatTokenLimit) + " characters."
-												answer, _ = geminiClient.AnswerQuestion(ctx, p, succinctPrompt, sessionManager, businessContext)
+										timer = time.AfterFunc(3*time.Second, func() {
+											logutil.Infof("[note-monitor] 3 seconds of inactivity after '?' detected. Proceeding to _Answering.\n")
+											// Append answering message and set pastel amber
+											fetched, err := client.GetNote(noteID, false)
+											var currText string
+											if err == nil {
+												currText, _ = fetched["text"].(string)
 											}
-											noteMeta := map[string]interface{}{
-												"title":            p.Name + " Answer",
-												"text":             answer,
-												"location":         map[string]interface{}{"x": ansX, "y": ansY},
-												"size":             map[string]interface{}{"width": qw, "height": qh},
-												"background_color": colors[i%len(colors)],
+											newText := currText + "\nPlease wait - answering."
+											updateText := map[string]interface{}{
+												"text":             newText,
+												"background_color": "#ffe4b3",
 											}
-											ansNote, _ := client.CreateNote(noteMeta)
-											ansNoteID, _ := ansNote["id"].(string)
-											answerNoteIDs[i] = ansNoteID
-										}
-										// 2. Create meta answer notes in corners, after all answers are created
-										for i, p := range personas {
-											// Gather other answers
-											others := []string{}
-											for j, ans := range answerNoteIDs {
-												if i != j {
-													ansNote, _ := client.GetNote(ans, false)
-													ansText, _ := ansNote["text"].(string)
-													others = append(others, fmt.Sprintf("%s said: %s", personas[j].Name, ansText))
+											logutil.Infof("[note-monitor] Attempting to update note for answering: payload=%v", updateText)
+											resp, err := client.UpdateNote(noteID, updateText)
+											respJSON, _ := json.MarshalIndent(resp, "", "  ")
+											if err != nil {
+												logutil.Errorf("[note-monitor] UpdateNote (to answering) error: %v", err)
+											} else {
+												logutil.Infof("[note-monitor] UpdateNote (to answering) response: %s", string(respJSON))
+											}
+											// --- Persona Q&A Workflow ---
+											// 1. Extract the user's question (strip monitoring/answering messages)
+											question := currText
+											if idx := strings.Index(question, "-->"); idx != -1 {
+												question = question[idx+3:]
+											}
+											question = strings.TrimSpace(strings.Split(question, "Please wait")[0])
+											// Define grid positions for 4 personas: top, right, bottom, left (answers); top-right, bottom-right, bottom-left, top-left (meta answers)
+											gridPositions := [][2]float64{
+												{0, -1},  // top (Persona 1 Answer)
+												{1, 0},   // right (Persona 2 Answer)
+												{0, 1},   // bottom (Persona 3 Answer)
+												{-1, 0},  // left (Persona 4 Answer)
+												{1, -1},  // top-right (Persona 2 Meta)
+												{1, 1},   // bottom-right (Persona 3 Meta)
+												{-1, 1},  // bottom-left (Persona 4 Meta)
+												{-1, -1}, // top-left (Persona 1 Meta)
+											}
+											answerNoteIDs := make([]string, 4)
+											metaNoteIDs := make([]string, 4)
+											// 1. Create answer notes in cardinal directions
+											for i, p := range personas {
+												pos := gridPositions[i]
+												ansX := qx + pos[0]*qw
+												ansY := qy + pos[1]*qh
+												answer, _ := geminiClient.AnswerQuestion(ctx, p, question, sessionManager, businessContext)
+												if len(answer) > chatTokenLimit {
+													succinctPrompt := "Please rephrase your answer in a much more succinct, short, and verbal way. Limit your response to " + fmt.Sprintf("%d", chatTokenLimit) + " characters."
+													answer, _ = geminiClient.AnswerQuestion(ctx, p, succinctPrompt, sessionManager, businessContext)
 												}
+												noteMeta := map[string]interface{}{
+													"title":            p.Name + " Answer",
+													"text":             answer,
+													"location":         map[string]interface{}{"x": ansX, "y": ansY},
+													"size":             map[string]interface{}{"width": qw, "height": qh},
+													"background_color": colors[i%len(colors)],
+												}
+												ansNote, _ := client.CreateNote(noteMeta)
+												ansNoteID, _ := ansNote["id"].(string)
+												answerNoteIDs[i] = ansNoteID
 											}
-											metaPrompt := fmt.Sprintf("Thank you %s for the interesting answer. Does what you heard from the others change what you think in any way? You heard: %s", p.Name, strings.Join(others, "; "))
-											metaAnswer, _ := geminiClient.AnswerQuestion(ctx, p, metaPrompt, sessionManager, businessContext)
-											if len(metaAnswer) > chatTokenLimit {
-												succinctPrompt := "Please rephrase your answer in a much more succinct, short, and verbal way. Limit your response to " + fmt.Sprintf("%d", chatTokenLimit) + " characters."
-												metaAnswer, _ = geminiClient.AnswerQuestion(ctx, p, succinctPrompt, sessionManager, businessContext)
+											// 2. Create meta answer notes in corners, after all answers are created
+											for i, p := range personas {
+												// Gather other answers
+												others := []string{}
+												for j, ans := range answerNoteIDs {
+													if i != j {
+														ansNote, _ := client.GetNote(ans, false)
+														ansText, _ := ansNote["text"].(string)
+														others = append(others, fmt.Sprintf("%s said: %s", personas[j].Name, ansText))
+													}
+												}
+												metaPrompt := fmt.Sprintf("Thank you %s for the interesting answer. Does what you heard from the others change what you think in any way? You heard: %s", p.Name, strings.Join(others, "; "))
+												metaAnswer, _ := geminiClient.AnswerQuestion(ctx, p, metaPrompt, sessionManager, businessContext)
+												if len(metaAnswer) > chatTokenLimit {
+													succinctPrompt := "Please rephrase your answer in a much more succinct, short, and verbal way. Limit your response to " + fmt.Sprintf("%d", chatTokenLimit) + " characters."
+													metaAnswer, _ = geminiClient.AnswerQuestion(ctx, p, succinctPrompt, sessionManager, businessContext)
+												}
+												metaPos := gridPositions[4+i]
+												metaX := qx + metaPos[0]*qw
+												metaY := qy + metaPos[1]*qh
+												metaMeta := map[string]interface{}{
+													"title":            p.Name + " Meta Answer",
+													"text":             metaAnswer,
+													"location":         map[string]interface{}{"x": metaX, "y": metaY},
+													"size":             map[string]interface{}{"width": qw, "height": qh},
+													"background_color": colors[i%len(colors)],
+												}
+												metaNote, _ := client.CreateNote(metaMeta)
+												metaNoteID, _ := metaNote["id"].(string)
+												metaNoteIDs[i] = metaNoteID
 											}
-											metaPos := gridPositions[4+i]
-											metaX := qx + metaPos[0]*qw
-											metaY := qy + metaPos[1]*qh
-											metaMeta := map[string]interface{}{
-												"title":            p.Name + " Meta Answer",
-												"text":             metaAnswer,
-												"location":         map[string]interface{}{"x": metaX, "y": metaY},
-												"size":             map[string]interface{}{"width": qw, "height": qh},
-												"background_color": colors[i%len(colors)],
+											// 3. Create connectors: question -> answer, answer -> meta answer
+											for i := range personas {
+												connMeta1 := map[string]interface{}{
+													"from_id": noteID,
+													"to_id":   answerNoteIDs[i],
+												}
+												client.CreateConnector(connMeta1)
+												connMeta2 := map[string]interface{}{
+													"from_id": answerNoteIDs[i],
+													"to_id":   metaNoteIDs[i],
+												}
+												client.CreateConnector(connMeta2)
 											}
-											metaNote, _ := client.CreateNote(metaMeta)
-											metaNoteID, _ := metaNote["id"].(string)
-											metaNoteIDs[i] = metaNoteID
+											// After all, set question note color to pastel green
+											client.UpdateNote(noteID, map[string]interface{}{"background_color": "#ccffcc"})
+											// Ensure space for 3x3 grid of notes around the question note
+											if err := ensureGridSpace(client, noteID); err != nil {
+												logutil.Warnf("[note-monitor] Could not ensure grid space: %v\n", err)
+											}
+											// Stop monitoring this note
+											delete(noteMonitors, noteID)
+											logutil.Infof("[note-monitor] Stopped monitoring note ID: %s after switching to answering.", noteID)
+											// Exit the goroutine
+											return
+										})
+									} else {
+										// If text is the same, reset the timer
+										if timer != nil {
+											timer.Reset(3 * time.Second)
 										}
-										// 3. Create connectors: question -> answer, answer -> meta answer
-										for i := range personas {
-											connMeta1 := map[string]interface{}{
-												"from_id": noteID,
-												"to_id":   answerNoteIDs[i],
-											}
-											client.CreateConnector(connMeta1)
-											connMeta2 := map[string]interface{}{
-												"from_id": answerNoteIDs[i],
-												"to_id":   metaNoteIDs[i],
-											}
-											client.CreateConnector(connMeta2)
-										}
-										// After all, set question note color to pastel green
-										client.UpdateNote(noteID, map[string]interface{}{"background_color": "#ccffcc"})
-										// Ensure space for 3x3 grid of notes around the question note
-										if err := ensureGridSpace(client, noteID); err != nil {
-											logutil.Warnf("[note-monitor] Could not ensure grid space: %v\n", err)
-										}
-										// Stop monitoring this note
-										delete(noteMonitors, noteID)
-										logutil.Infof("[note-monitor] Stopped monitoring note ID: %s after switching to answering.", noteID)
-										// Exit the goroutine
-										return
-									})
-								} else {
-									// If text is the same, reset the timer
-									if timer != nil {
-										timer.Reset(3 * time.Second)
 									}
 								}
 							}
 						}
-					}
-				}(noteID, &noteTextExtracted, &imageID, personas, colors, qx, qy, qw, qh, geminiClient, sessionManager, businessContext)
+					}(noteID, &noteTextExtracted, &imageID, personas, colors, qx, qy, qw, qh, geminiClient, sessionManager, businessContext)
+				}
 			}
 			if imagePatched && notePatched && noteTextExtracted != "" {
 				logutil.Infof("[main] Note text extracted after '?': %s\n", noteTextExtracted)

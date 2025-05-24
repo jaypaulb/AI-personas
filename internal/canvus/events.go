@@ -37,6 +37,7 @@ const (
 	TriggerNone TriggerType = iota
 	TriggerBACCompleteImage
 	TriggerNewAIQuestion
+	TriggerCreatePersonasNote
 )
 
 // EventTrigger represents a detected trigger event
@@ -129,6 +130,14 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 						log.Printf("[trigger] New_AI_Question detected:\n%s\n", string(jsonRaw))
 						triggers <- EventTrigger{Type: TriggerNewAIQuestion, Widget: widget}
 					}
+					continue
+				}
+
+				// Detect Create_Personas note
+				if widType == "Note" && strings.TrimSpace(title) == "Create_Personas" {
+					jsonRaw, _ := json.MarshalIndent(raw, "", "  ")
+					log.Printf("[trigger] Create_Personas Note detected:\n%s\n", string(jsonRaw))
+					triggers <- EventTrigger{Type: TriggerCreatePersonasNote, Widget: widget}
 					continue
 				}
 			}
