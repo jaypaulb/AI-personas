@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/jaypaulb/AI-personas/canvusapi"
-	"github.com/jaypaulb/AI-personas/internal/logutil"
 )
 
 // CreatePersonas extracts business notes, generates personas, and creates persona notes and images on the canvas.
@@ -48,7 +47,7 @@ func CreatePersonas(ctx context.Context, client *canvusapi.Client) error {
 				if titleUpper == req {
 					businessNotes = append(businessNotes, w)
 					titleMap[req] = true
-					logutil.Infof("Extracted data from Note - %s\n", req)
+					fmt.Printf("Extracted data from Note - %s\n", req)
 				}
 			}
 		}
@@ -63,7 +62,7 @@ func CreatePersonas(ctx context.Context, client *canvusapi.Client) error {
 	missing := false
 	for _, req := range requiredTitles {
 		if !titleMap[req] {
-			logutil.Errorf("Note - %s not found Aborting\n", req)
+			fmt.Printf("Note - %s not found Aborting\n", req)
 			missing = true
 		}
 	}
@@ -75,7 +74,7 @@ func CreatePersonas(ctx context.Context, client *canvusapi.Client) error {
 		return fmt.Errorf("[CreatePersonas] Personas anchor not found. Aborting.")
 	}
 
-	logutil.Infof("Successfully extracted all data - parsing and compiling report for AI\n")
+	fmt.Printf("Successfully extracted all data - parsing and compiling report for AI\n")
 	// Step 3: Structure and log the data
 	structured := struct {
 		BusinessNotes  []string               `json:"business_notes"`
@@ -92,26 +91,32 @@ func CreatePersonas(ctx context.Context, client *canvusapi.Client) error {
 	businessContext := strings.Join(structured.BusinessNotes, "\n\n")
 
 	// --- Persona existence check ---
-	personaTitles := []string{"Persona 1 Persona", "Persona 2 Persona", "Persona 3 Persona", "Persona 4 Persona"}
 	existingPersonas := make(map[int]map[string]interface{}) // index -> widget
+	personaTitles := make([]string, 4)
+	for i := 0; i < 4; i++ {
+		personaTitles[i] = ""
+	}
+
+	// First, try to match existing notes to personas by index
 	for _, w := range widgets {
 		typeStr, _ := w["widget_type"].(string)
 		title, _ := w["title"].(string)
-		for i, pt := range personaTitles {
-			if typeStr == "Note" && strings.EqualFold(strings.TrimSpace(title), pt) {
+		for i := 0; i < 4; i++ {
+			prefix := fmt.Sprintf("Persona %d: ", i+1)
+			if typeStr == "Note" && strings.HasPrefix(strings.TrimSpace(title), prefix) {
 				existingPersonas[i] = w
+				personaTitles[i] = title // Save the actual title for later use
 			}
 		}
 	}
 
 	if len(existingPersonas) == 4 {
-		logutil.Infof("All 4 persona notes already exist. Using existing data.")
-		// Optionally: parse and log the persona data from the notes
+		fmt.Printf("All 4 persona notes already exist. Using existing data.\n")
 		for i := 0; i < 4; i++ {
 			w := existingPersonas[i]
 			title, _ := w["title"].(string)
 			text, _ := w["text"].(string)
-			logutil.Infof("Existing %s: %s", title, text)
+			fmt.Printf("Existing %s: %s\n", title, text)
 		}
 		return nil
 	}
@@ -157,8 +162,12 @@ func CreatePersonas(ctx context.Context, client *canvusapi.Client) error {
 		noteH := 0.40 // fixed fraction of anchor height
 		// Place note at the bottom of the anchor area, with a border
 		noteY := ay + (ah * 0.34)
+
+		title := fmt.Sprintf("Persona %d: %s", i+1, p.Name)
+		personaTitles[i] = title
+
 		noteMeta := map[string]interface{}{
-			"title":            personaTitles[i],
+			"title":            title,
 			"text":             formatted,
 			"location":         map[string]interface{}{"x": x, "y": noteY},
 			"size":             map[string]interface{}{"width": imgW, "height": noteH * ah},
@@ -166,52 +175,52 @@ func CreatePersonas(ctx context.Context, client *canvusapi.Client) error {
 		}
 		noteWidget, err := client.CreateNote(noteMeta)
 		if err != nil {
-			logutil.Warnf("[CreatePersonas] Failed to create persona note: %v\n", err)
+			fmt.Printf("[CreatePersonas] Failed to create persona note: %v\n", err)
 		} else {
 			noteWidgetID, _ := noteWidget["id"].(string)
-			logutil.Infof("[CreatePersonas] Persona note created: %s (ID: %s)", personaTitles[i], noteWidgetID)
+			fmt.Printf("[CreatePersonas] Persona note created: %s (ID: %s)\n", title, noteWidgetID)
 		}
 		// Start image generation/upload in a goroutine
 		imgWg.Add(1)
-		go func(p Persona, x, imgY, imgW, imgHpx float64, idx int) {
+		go func(p Persona, x, imgY, imgW, imgHpx float64, idx int, title string) {
 			defer imgWg.Done()
-			logutil.Debugf("[CreatePersonas] Calling OpenAI DALL·E for persona: %s", personaTitles[idx])
+			fmt.Printf("[CreatePersonas] Calling OpenAI DALL·E for persona: %s\n", title)
 			imgBytes, err := GeneratePersonaImageOpenAI(p)
-			logutil.Debugf("[CreatePersonas] OpenAI DALL·E call returned for persona: %s, err: %v", personaTitles[idx], err)
+			fmt.Printf("[CreatePersonas] OpenAI DALL·E call returned for persona: %s, err: %v\n", title, err)
 			imgPath := ""
 			if err != nil {
-				logutil.Warnf("[CreatePersonas] Persona image not generated: %v\n", err)
+				fmt.Printf("[CreatePersonas] Persona image not generated: %v\n", err)
 				return
 			}
 			tmpfile, err := os.CreateTemp("", "persona_*.png")
 			if err != nil {
-				logutil.Warnf("[CreatePersonas] Could not create temp file for persona image: %v\n", err)
+				fmt.Printf("[CreatePersonas] Could not create temp file for persona image: %v\n", err)
 				return
 			}
 			imgPath = tmpfile.Name()
 			if _, err := tmpfile.Write(imgBytes); err != nil {
-				logutil.Warnf("[CreatePersonas] Could not write persona image to temp file: %v\n", err)
+				fmt.Printf("[CreatePersonas] Could not write persona image to temp file: %v\n", err)
 				tmpfile.Close()
 				os.Remove(imgPath)
 				return
 			}
 			tmpfile.Close()
 			imgMeta := map[string]interface{}{
-				"title":    personaTitles[idx] + " Headshot",
+				"title":    title + " Headshot",
 				"location": map[string]interface{}{"x": x, "y": imgY},
 				"size":     map[string]interface{}{"width": imgW, "height": imgHpx},
 			}
 			imgWidget, err := client.CreateImage(imgPath, imgMeta)
 			if err != nil {
-				logutil.Warnf("[CreatePersonas] Failed to upload persona image: %v\n", err)
+				fmt.Printf("[CreatePersonas] Failed to upload persona image: %v\n", err)
 			} else {
 				imgWidgetID, _ := imgWidget["id"].(string)
-				logutil.Infof("[CreatePersonas] Persona image uploaded: %s (ID: %s)", personaTitles[idx], imgWidgetID)
+				fmt.Printf("[CreatePersonas] Persona image uploaded: %s (ID: %s)\n", title+" Headshot", imgWidgetID)
 			}
 			os.Remove(imgPath)
-		}(p, x, imgY, imgW, imgHpx, i)
+		}(p, x, imgY, imgW, imgHpx, i, title)
 	}
-	imgWg.Wait()
+	fmt.Printf("[CreatePersonas] Persona image generation running in background.\n")
 	// --- end Gemini persona generation ---
 	return nil
 }

@@ -80,7 +80,7 @@ Business Context:
 		}
 	}
 	config := &genai.GenerateContentConfig{
-		Temperature: float32(temp),
+		Temperature: genai.Ptr(float32(temp)),
 	}
 
 	resp, err := c.genai.Models.GenerateContent(ctx, model, []*genai.Content{{Parts: []*genai.Part{{Text: prompt}}}}, config)
@@ -171,7 +171,17 @@ func (sm *SessionManager) GetOrCreateSession(ctx context.Context, persona Person
 	if sess, ok := sm.sessions[persona.Name]; ok {
 		return sess, nil
 	}
-	chat, err := sm.client.Chats.Create(ctx, "gemini-1.5-flash", nil, nil)
+	// Read temperature from env
+	temp := 0.7
+	if v := os.Getenv("LLM_TEMP"); v != "" {
+		if f, err := strconv.ParseFloat(v, 32); err == nil {
+			temp = f
+		}
+	}
+	config := &genai.GenerateContentConfig{
+		Temperature: genai.Ptr(float32(temp)),
+	}
+	chat, err := sm.client.Chats.Create(ctx, "gemini-1.5-flash", config, nil)
 	if err != nil {
 		return nil, err
 	}

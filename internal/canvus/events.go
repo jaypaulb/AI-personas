@@ -111,14 +111,12 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 			line, err := r.ReadBytes('\n')
 			if err != nil {
 				if err == io.EOF {
-					log.Printf("[event] EOF reached in widget event stream")
 					time.Sleep(1 * time.Second)
 					continue
 				}
-				log.Printf("[event] Error reading widget event stream: %v", err)
+				log.Printf("Error reading widget event stream: %v", err)
 				return
 			}
-			log.Printf("[event] RAW: %s", strings.TrimSpace(string(line)))
 			trimmed := strings.TrimSpace(string(line))
 			if trimmed == "" || trimmed == "\r" {
 				continue // skip keep-alive or empty lines

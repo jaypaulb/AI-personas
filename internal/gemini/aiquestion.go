@@ -410,7 +410,7 @@ func HandleAIQuestion(ctx context.Context, client *canvusapi.Client, trig canvus
 		}
 	}
 	if !CheckQuestionPresent(noteID, client) {
-		log.Printf("[step] Pausing HandleAIQuestion after CheckQuestionPresent for noteID: %s, waiting for question event", noteID)
+		log.Printf("[step] Exiting HandleAIQuestion after CheckQuestionPresent for noteID: %s", noteID)
 		EnsureHelperNoteForQuestion(noteID, client)
 		ch := make(chan struct{})
 		ctx, cancel := context.WithCancel(context.Background())
