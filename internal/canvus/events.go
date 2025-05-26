@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jaypaulb/AI-personas/canvusapi"
@@ -38,6 +39,7 @@ const (
 	TriggerBACCompleteImage
 	TriggerNewAIQuestion
 	TriggerCreatePersonasNote
+	TriggerQnoteQuestionDetected
 )
 
 // EventTrigger represents a detected trigger event
@@ -56,6 +58,39 @@ type EventMonitor struct {
 func NewEventMonitor(client *canvusapi.Client) *EventMonitor {
 	return &EventMonitor{Client: client}
 }
+
+// Handler registry for Qnote question detection
+var qnoteQuestionHandlers sync.Map // noteID -> struct{color string; handler func(WidgetEvent)}
+
+// RegisterQnoteQuestionHandlerWithColor allows registration of a callback and expected color for a Qnote
+func RegisterQnoteQuestionHandlerWithColor(noteID string, color string, handler func(WidgetEvent)) {
+	qnoteQuestionHandlers.Store(noteID, struct {
+		color   string
+		handler func(WidgetEvent)
+	}{color, handler})
+}
+
+// Helper to check if a string is a question (imported from gemini/aiquestion.go)
+func IsQuestion(text string) bool {
+	questionWords := []string{"what", "why", "how", "when", "where", "who", "which", "is", "are", "do", "does", "can", "could", "would", "should"}
+	lower := strings.ToLower(text)
+	if strings.Contains(lower, "?") {
+		return true
+	}
+	for _, w := range questionWords {
+		if strings.HasPrefix(lower, w+" ") || strings.Contains(lower, w+" ") {
+			return true
+		}
+	}
+	return false
+}
+
+// Debounce state for Qnote question detection
+var (
+	qnoteDebounceTimers   sync.Map // noteID -> *time.Timer
+	qnoteLatestEvents     sync.Map // noteID -> WidgetEvent
+	qnoteDebounceDuration = 1 * time.Second
+)
 
 // SubscribeAndDetectTriggers subscribes to widget events and sends triggers to the channel
 func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers chan<- EventTrigger) {
@@ -76,12 +111,14 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 			line, err := r.ReadBytes('\n')
 			if err != nil {
 				if err == io.EOF {
+					log.Printf("[event] EOF reached in widget event stream")
 					time.Sleep(1 * time.Second)
 					continue
 				}
-				log.Printf("Error reading widget event stream: %v", err)
+				log.Printf("[event] Error reading widget event stream: %v", err)
 				return
 			}
+			log.Printf("[event] RAW: %s", strings.TrimSpace(string(line)))
 			trimmed := strings.TrimSpace(string(line))
 			if trimmed == "" || trimmed == "\r" {
 				continue // skip keep-alive or empty lines
@@ -139,6 +176,55 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 					log.Printf("[trigger] Create_Personas Note detected:\n%s\n", string(jsonRaw))
 					triggers <- EventTrigger{Type: TriggerCreatePersonasNote, Widget: widget}
 					continue
+				}
+
+				// Log every note event for diagnostics
+				if widType == "Note" && id != "" {
+					log.Printf("[event] Note event: id=%s, title=%s, color(raw)=%q, text=%q", id, title, raw["background_color"], text)
+				}
+
+				// Only process and log Qnote events for New_AI_Question notes
+				if widType == "Note" && id != "" && strings.EqualFold(title, "New_AI_Question") {
+					bg, _ := raw["background_color"].(string)
+					bgLower := strings.ToLower(strings.TrimSpace(bg))
+					log.Printf("[debug] QNOTE event: id=%s, title=%s, color(raw)=%q, color(lower)=%q, text=%q", id, title, bg, bgLower, text)
+					if handlerRaw, ok := qnoteQuestionHandlers.Load(id); ok {
+						entry := handlerRaw.(struct {
+							color   string
+							handler func(WidgetEvent)
+						})
+						expectedColor := strings.ToLower(strings.TrimSpace(entry.color))
+						colorMatch := bgLower == expectedColor
+						if !colorMatch {
+							log.Printf("[debug] QNOTE color mismatch for noteID=%s: got %q, expected %q", id, bgLower, expectedColor)
+						}
+						log.Printf("[debug] QNOTE handler found for noteID=%s | colorMatch: %v | expectedColor: %q", id, colorMatch, expectedColor)
+						if colorMatch {
+							// Debounce logic: store latest event and reset timer
+							qnoteLatestEvents.Store(id, widget)
+							if timerRaw, loaded := qnoteDebounceTimers.LoadOrStore(id, nil); loaded && timerRaw != nil {
+								timerRaw.(*time.Timer).Stop()
+							}
+							timer := time.AfterFunc(qnoteDebounceDuration, func() {
+								log.Printf("[debug] [debounce] QNOTE debounce timer fired for noteID=%s", id)
+								// On debounce expiry, check if latest event is a question
+								val, ok := qnoteLatestEvents.Load(id)
+								if !ok {
+									log.Printf("[debug] [debounce] QNOTE no latest event for noteID=%s", id)
+									return
+								}
+								latestWidget := val.(WidgetEvent)
+								isQ := IsQuestion(latestWidget.Text)
+								log.Printf("[debug] [debounce] QNOTE IsQuestion for noteID=%s | IsQuestion: %v (input: %q)", id, isQ, latestWidget.Text)
+								if isQ {
+									log.Printf("[trigger] [debounce] QNOTE question detected for noteID=%s", id)
+									triggers <- EventTrigger{Type: TriggerQnoteQuestionDetected, Widget: latestWidget}
+									entry.handler(latestWidget)
+								}
+							})
+							qnoteDebounceTimers.Store(id, timer)
+						}
+					}
 				}
 			}
 		}
