@@ -185,16 +185,22 @@ func startWebServer(client *canvusapi.Client) {
 	if port == "" {
 		port = "8080"
 	}
-	fqdn, err := fqdn.FqdnHostname()
-	if err != nil || fqdn == "" {
-		fqdn, _ = os.Hostname()
+
+	webURL := os.Getenv("PUBLIC_WEB_URL")
+	var fqdnHost string
+	if webURL == "" {
+		var err error
+		fqdnHost, err = fqdn.FqdnHostname()
+		if err != nil || fqdnHost == "" {
+			fqdnHost, _ = os.Hostname()
+		}
+		webURL = "http://" + fqdnHost + ":" + port + "/"
 	}
-	webURL := "http://" + fqdn + ":" + port + "/"
 	qrPath := "qr_remote.png"
 
 	startQRCodeWatcher(client, webURL, qrPath)
 
-	log.Printf("[web] Starting web server on :%s (FQDN: %s)", port, fqdn)
+	log.Printf("[web] Starting web server on :%s (FQDN: %s)", port, fqdnHost)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			w.Header().Set("Content-Type", "text/html")
@@ -334,7 +340,7 @@ func startWebServer(client *canvusapi.Client) {
 	})
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 	go func() {
-		log.Printf("[web] Listening on :%s (FQDN: %s)", port, fqdn)
+		log.Printf("[web] Listening on :%s (FQDN: %s)", port, fqdnHost)
 		http.ListenAndServe(":"+port, nil)
 	}()
 }
