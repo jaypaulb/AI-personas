@@ -320,6 +320,66 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 			continue
 		}
 	}
+	// --- Create anchor for answer/meta notes ---
+	allNoteIDs := []string{}
+	for _, id := range answerNoteIDs {
+		if id != "" {
+			allNoteIDs = append(allNoteIDs, id)
+		}
+	}
+	for _, id := range metaNoteIDs {
+		if id != "" {
+			allNoteIDs = append(allNoteIDs, id)
+		}
+	}
+	if len(allNoteIDs) > 0 {
+		widgets, err := client.GetWidgets(false)
+		if err == nil {
+			minX, minY := 1e9, 1e9
+			maxX, maxY := -1e9, -1e9
+			noteCount := 0
+			for _, w := range widgets {
+				id, _ := w["id"].(string)
+				for _, targetID := range allNoteIDs {
+					if id == targetID {
+						loc, _ := w["location"].(map[string]interface{})
+						size, _ := w["size"].(map[string]interface{})
+						x, _ := loc["x"].(float64)
+						y, _ := loc["y"].(float64)
+						w_, _ := size["width"].(float64)
+						h_, _ := size["height"].(float64)
+						if x < minX {
+							minX = x
+						}
+						if y < minY {
+							minY = y
+						}
+						if x+w_ > maxX {
+							maxX = x + w_
+						}
+						if y+h_ > maxY {
+							maxY = y + h_
+						}
+						noteCount++
+						break
+					}
+				}
+			}
+			if noteCount > 0 {
+				anchorPayload := map[string]interface{}{
+					"anchor_name": question,
+					"location":    map[string]interface{}{"x": minX, "y": minY},
+					"size":        map[string]interface{}{"width": maxX - minX, "height": maxY - minY},
+					"notes":       allNoteIDs,
+				}
+				if anchorResp, err := client.CreateAnchor(anchorPayload); err == nil {
+					log.Printf("[anchor] Created anchor for Qnote %s: %v", qnoteID, anchorResp)
+				} else {
+					log.Printf("[anchor] Failed to create anchor for Qnote %s: %v", qnoteID, err)
+				}
+			}
+		}
+	}
 	// After all, set question note color to pastel green and restore only the original question
 	origQ := currText
 	if idx := strings.Index(origQ, "-->"); idx != -1 {
