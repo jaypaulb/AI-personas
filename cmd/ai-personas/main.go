@@ -81,6 +81,7 @@ func main() {
 		for k, v := range envMap {
 			os.Setenv(k, v)
 		}
+		log.Printf("[startup] .env loaded from: %s", absEnvPath)
 	}
 
 	if os.Getenv("DEBUG") == "1" {
@@ -126,11 +127,11 @@ func main() {
 		log.Printf("[main] Waiting for triggers...")
 		select {
 		case trig := <-triggers:
-			log.Printf("[main] Received trigger: %+v", trig)
+			log.Printf("[main] Received trigger: {Type:%d Widget:{ID:%s Type:%s Title:%s}}", trig.Type, trig.Widget.ID, trig.Widget.Type, trig.Widget.Title)
 			switch trig.Type {
 			case canvus.TriggerCreatePersonasNote:
 				log.Printf("\n\nTrigger - Create_Personas Note detected. Proceeding with Persona Creation.\n\n")
-				err := gemini.CreatePersonas(ctx, client)
+				err := gemini.CreatePersonas(ctx, trig.Widget.ID, client)
 				if err != nil {
 					log.Printf("[error] CreatePersonas failed: %v\n", err)
 				} else {

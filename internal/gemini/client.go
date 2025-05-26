@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -266,7 +265,6 @@ func GeneratePersonaImageOpenAI(persona Persona) ([]byte, error) {
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("OpenAI HTTP request failed: %w", err)
-			log.Printf("[warn] OpenAI image gen attempt %d failed: %v", attempt, lastErr)
 			if attempt < 3 {
 				time.Sleep(2 * time.Second)
 				continue
@@ -277,7 +275,6 @@ func GeneratePersonaImageOpenAI(persona Persona) ([]byte, error) {
 		resp.Body.Close()
 		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
 			lastErr = fmt.Errorf("OpenAI API server error: %s", string(respBody))
-			log.Printf("[warn] OpenAI image gen attempt %d got server error: %s", attempt, string(respBody))
 			if attempt < 3 {
 				time.Sleep(2 * time.Second)
 				continue
@@ -288,9 +285,10 @@ func GeneratePersonaImageOpenAI(persona Persona) ([]byte, error) {
 			lastErr = fmt.Errorf("OpenAI API error: %s", string(respBody))
 			// Only retry on explicit 'server_error' type
 			if bytes.Contains(respBody, []byte("server_error")) && attempt < 3 {
-				log.Printf("[warn] OpenAI image gen attempt %d got server_error, retrying", attempt)
-				time.Sleep(2 * time.Second)
-				continue
+				if attempt < 3 {
+					time.Sleep(2 * time.Second)
+					continue
+				}
 			}
 			break
 		}

@@ -13,7 +13,7 @@ import (
 
 // CreatePersonas extracts business notes, generates personas, and creates persona notes and images on the canvas.
 // Returns error if any required step fails.
-func CreatePersonas(ctx context.Context, client *canvusapi.Client) error {
+func CreatePersonas(ctx context.Context, qnoteID string, client *canvusapi.Client) error {
 	// Step 1: Fetch all widgets
 	widgets, err := client.GetWidgets(false)
 	if err != nil {

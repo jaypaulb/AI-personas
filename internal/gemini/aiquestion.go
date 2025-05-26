@@ -20,25 +20,23 @@ var qnoteProcessingList sync.Map // qnoteID -> true
 // Wait channels for Qnotes (thread-safe)
 var qnoteWaitChans sync.Map // noteID -> chan struct{}
 
+// Map to track helper note IDs per Qnote
+var qnoteHelperNotes sync.Map // qnoteID -> helperNoteID
+
 // TODO: Update logging functions to be less verbose and more configurable for production use.
 
 // IsQnoteProcessing checks if the Qnote is already being processed.
 func IsQnoteProcessing(qnoteID string) bool {
-	log.Printf("[step] IsQnoteProcessing called for noteID: %s", qnoteID)
 	if _, already := qnoteProcessingList.LoadOrStore(qnoteID, true); already {
-		log.Printf("[qnote-processing] Skipping note %s: already being processed.", qnoteID)
 		return true
 	}
-	log.Printf("[qnote-processing] Added note %s to processing list.", qnoteID)
 	return false
 }
 
 // CheckPersonasPresent checks for the presence of all 4 persona notes for the Qnote.
 func CheckPersonasPresent(qnoteID string, client *canvusapi.Client) bool {
-	log.Printf("[step] CheckPersonasPresent called for noteID: %s", qnoteID)
 	widgets, err := client.GetWidgets(false)
 	if err != nil {
-		log.Printf("[personas-check] Failed to fetch widgets: %v", err)
 		return false
 	}
 	personaCount := 0
@@ -53,26 +51,20 @@ func CheckPersonasPresent(qnoteID string, client *canvusapi.Client) bool {
 		log.Printf("[personas-check] All 4 persona notes present for Qnote %s.", qnoteID)
 		return true
 	}
-	log.Printf("[personas-check] Missing persona notes for Qnote %s. Found %d/4.", qnoteID, personaCount)
 	return false
 }
 
 // CheckQuestionPresent checks if the Qnote contains a question.
 func CheckQuestionPresent(qnoteID string, client *canvusapi.Client) bool {
-	log.Printf("[step] CheckQuestionPresent called for noteID: %s", qnoteID)
 	qWidget, err := client.GetNote(qnoteID, false)
 	if err != nil {
-		log.Printf("[question-check] Failed to fetch Qnote %s: %v", qnoteID, err)
 		return false
 	}
 	currText, _ := qWidget["text"].(string)
 	trimmedText := strings.TrimSpace(currText)
-	log.Printf("[question-check] Qnote %s text: %q", qnoteID, trimmedText)
 	if strings.HasSuffix(trimmedText, "?") {
-		log.Printf("[question-check] Qnote %s contains a question.", qnoteID)
 		return true
 	}
-	log.Printf("[question-check] Qnote %s does not contain a question.", qnoteID)
 	return false
 }
 
@@ -99,10 +91,8 @@ func BuildConnectorPayload(srcID, dstID string) map[string]interface{} {
 
 // EnsureHelperNoteForQuestion always creates or updates the helper note and connector, sets Qnote to amber, then calls MonitorQuestionNote
 func EnsureHelperNoteForQuestion(qnoteID string, client *canvusapi.Client) {
-	log.Printf("[step] EnsureHelperNoteForQuestion called for noteID: %s", qnoteID)
 	qWidget, err := client.GetNote(qnoteID, false)
 	if err != nil {
-		log.Printf("[helper-note] Failed to fetch Qnote %s: %v", qnoteID, err)
 		return
 	}
 	qLoc, _ := qWidget["location"].(map[string]interface{})
@@ -114,7 +104,6 @@ func EnsureHelperNoteForQuestion(qnoteID string, client *canvusapi.Client) {
 	helperTitle := "Helper: Please enter a question for this note"
 	widgets, err := client.GetWidgets(false)
 	if err != nil {
-		log.Printf("[helper-note] Failed to fetch widgets: %v", err)
 		return
 	}
 	var helperID string
@@ -140,17 +129,15 @@ func EnsureHelperNoteForQuestion(qnoteID string, client *canvusapi.Client) {
 		}
 		helperNote, err := client.CreateNote(noteMeta)
 		if err != nil {
-			log.Printf("[helper-note] Failed to create helper note: %v", err)
 			return
 		}
 		helperID, _ = helperNote["id"].(string)
 		connMeta := BuildConnectorPayload(helperID, qnoteID)
 		_, _ = client.CreateConnector(connMeta)
 		log.Printf("[helper-note] Created helper note and connector for Qnote %s.", qnoteID)
-	} else {
-		log.Printf("[helper-note] Helper note already present for Qnote %s.", qnoteID)
 	}
-	// Always update Qnote to amber and capture the exact color value returned
+	// Track the helper note ID for this Qnote
+	qnoteHelperNotes.Store(qnoteID, helperID)
 	updateResp, _ := client.UpdateNote(qnoteID, map[string]interface{}{"background_color": "#ffe4b3"})
 	exactAmber, _ := updateResp["background_color"].(string)
 	log.Printf("[monitor] Qnote color set to: %q for noteID: %s", exactAmber, qnoteID)
@@ -158,7 +145,6 @@ func EnsureHelperNoteForQuestion(qnoteID string, client *canvusapi.Client) {
 
 // OnQuestionDetected updates helper note and Qnote when a question is detected, then calls AnswerQuestion.
 func OnQuestionDetected(qnoteID string, client *canvusapi.Client, chatTokenLimit int) {
-	log.Printf("[step] OnQuestionDetected called for noteID: %s", qnoteID)
 	// Update helper note to 'Processing Question'
 	helperTitle := "Helper: Please enter a question for this note"
 	widgets, err := client.GetWidgets(false)
@@ -186,23 +172,19 @@ func OnQuestionDetected(qnoteID string, client *canvusapi.Client, chatTokenLimit
 
 // AnswerQuestion handles persona answers, meta-answers, note creation, and connectors.
 func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int) {
-	log.Printf("[step] AnswerQuestion called for noteID: %s", qnoteID)
 	ctx := context.Background()
 	defer func() {
 		qnoteProcessingList.Delete(qnoteID)
 	}()
-	// Fetch Qnote and personas
 	qWidget, _ := client.GetNote(qnoteID, false)
 	currText, _ := qWidget["text"].(string)
 	personas := []Persona{}
 	geminiClient, err := NewClient(ctx)
 	if err != nil {
-		log.Printf("[error] NewClient failed: %v", err)
 		return
 	}
 	personas, err = geminiClient.GeneratePersonas(ctx, "Q&A context")
 	if err != nil {
-		log.Printf("[error] GeneratePersonas failed: %v", err)
 		return
 	}
 	colors := []string{"#2196f3ff", "#4caf50ff", "#ff9800ff", "#9c27b0ff"}
@@ -261,15 +243,12 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 			"scale":            scale,
 		}
 		ansNote, err := client.CreateNote(noteMeta)
-		log.Printf("[debug] Created answer note for persona %s: %+v", p.Name, ansNote)
 		if err != nil {
-			log.Printf("[error] Failed to create answer note for persona %s: %v", p.Name, err)
 			answerNoteIDs[i] = ""
 			continue
 		}
 		ansNoteID, ok := ansNote["id"].(string)
 		if !ok || ansNoteID == "" {
-			log.Printf("[error] Answer note for persona %s missing ID", p.Name)
 			answerNoteIDs[i] = ""
 			continue
 		}
@@ -312,15 +291,12 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 			"scale":            scale,
 		}
 		metaNote, err := client.CreateNote(metaMeta)
-		log.Printf("[debug] Created meta note for persona %s: %+v", p.Name, metaNote)
 		if err != nil {
-			log.Printf("[error] Failed to create meta note for persona %s: %v", p.Name, err)
 			metaNoteIDs[i] = ""
 			continue
 		}
 		metaNoteID, ok := metaNote["id"].(string)
 		if !ok || metaNoteID == "" {
-			log.Printf("[error] Meta note for persona %s missing ID", p.Name)
 			metaNoteIDs[i] = ""
 			continue
 		}
@@ -329,26 +305,18 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 	// 5. Create connectors: question -> answer, answer -> meta answer (matching layout)
 	for i := 0; i < 4; i++ {
 		if answerNoteIDs[i] == "" {
-			log.Printf("[error] Skipping connector creation for Answer %d: missing answer note ID", i+1)
 			continue
 		}
 		connMeta1 := BuildConnectorPayload(qnoteID, answerNoteIDs[i])
-		log.Printf("[debug] Creating connector payload: %+v", connMeta1)
 		if _, err := client.CreateConnector(connMeta1); err != nil {
-			log.Printf("[error] Failed to create connector Qnote->Answer: %v", err)
-		} else {
-			log.Printf("[connector] Created connector from Qnote %s to Answer %s", qnoteID, answerNoteIDs[i])
+			continue
 		}
 		if metaNoteIDs[i] == "" {
-			log.Printf("[error] Skipping connector creation for Meta %d: missing meta note ID", i+1)
 			continue
 		}
 		connMeta2 := BuildConnectorPayload(answerNoteIDs[i], metaNoteIDs[i])
-		log.Printf("[debug] Creating connector payload: %+v", connMeta2)
 		if _, err := client.CreateConnector(connMeta2); err != nil {
-			log.Printf("[error] Failed to create connector Answer->Meta: %v", err)
-		} else {
-			log.Printf("[connector] Created connector from Answer %s to Meta %s", answerNoteIDs[i], metaNoteIDs[i])
+			continue
 		}
 	}
 	// After all, set question note color to pastel green and restore only the original question
@@ -359,19 +327,12 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 	origQ = strings.TrimSpace(strings.Split(origQ, "Please wait")[0])
 	client.UpdateNote(qnoteID, map[string]interface{}{"background_color": "#ccffcc", "text": origQ})
 	answeredNotes.Store(qnoteID, true)
-	// Delete the helper note associated with this Qnote
-	helperTitle := "Helper: Please enter a question for this note"
-	widgets, err := client.GetWidgets(false)
-	if err == nil {
-		for _, w := range widgets {
-			typeStr, _ := w["widget_type"].(string)
-			title, _ := w["title"].(string)
-			if typeStr == "Note" && title == helperTitle {
-				noteID2, _ := w["id"].(string)
-				_ = client.DeleteNote(noteID2)
-				log.Printf("[helper-note] Deleted helper note %s for Qnote %s.", noteID2, qnoteID)
-			}
-		}
+	// Delete the helper note associated with this Qnote (by tracked ID)
+	if val, ok := qnoteHelperNotes.Load(qnoteID); ok {
+		helperID := val.(string)
+		_ = client.DeleteNote(helperID)
+		log.Printf("[helper-note] Deleted helper note %s for Qnote %s.", helperID, qnoteID)
+		qnoteHelperNotes.Delete(qnoteID)
 	}
 	log.Printf("[step] AnswerQuestion completed for noteID: %s", qnoteID)
 }
@@ -379,44 +340,118 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 // CleanupAfterAnswer deletes helper notes, stops monitors, and removes from processing list.
 func CleanupAfterAnswer(qnoteID string, client *canvusapi.Client) {
 	log.Printf("[step] CleanupAfterAnswer called for noteID: %s", qnoteID)
-	// Remove from processing list only; do not reset color
+	// Only delete the helper note associated with this Qnote (by tracked ID)
+	if val, ok := qnoteHelperNotes.Load(qnoteID); ok {
+		helperID := val.(string)
+		_ = client.DeleteNote(helperID)
+		log.Printf("[helper-note] Deleted helper note %s for Qnote %s.", helperID, qnoteID)
+		qnoteHelperNotes.Delete(qnoteID)
+	}
 	qnoteProcessingList.Delete(qnoteID)
+}
+
+// Add this new function to create a persona waiting helper note
+func EnsureHelperNoteForPersonas(qnoteID string, client *canvusapi.Client) {
+	qWidget, err := client.GetNote(qnoteID, false)
+	if err != nil {
+		return
+	}
+	qLoc, _ := qWidget["location"].(map[string]interface{})
+	qx := qLoc["x"].(float64)
+	qy := qLoc["y"].(float64)
+	qSize, _ := qWidget["size"].(map[string]interface{})
+	qw := qSize["width"].(float64)
+	qh := qSize["height"].(float64)
+	helperTitle := "Helper: Generating personas, please wait..."
+	widgets, err := client.GetWidgets(false)
+	if err != nil {
+		return
+	}
+	var helperID string
+	found := false
+	for _, w := range widgets {
+		typeStr, _ := w["widget_type"].(string)
+		title, _ := w["title"].(string)
+		if typeStr == "Note" && title == helperTitle {
+			helperID, _ = w["id"].(string)
+			found = true
+			break
+		}
+	}
+	if !found {
+		helperX := qx - 1.2*qw
+		helperY := qy - 1.1*qh // Place it above the Qnote
+		noteMeta := map[string]interface{}{
+			"title":            helperTitle,
+			"text":             "Personas are being generated. Please wait before proceeding.",
+			"location":         map[string]interface{}{"x": helperX, "y": helperY},
+			"size":             map[string]interface{}{"width": qw, "height": qh * 0.7},
+			"background_color": "#e0e0e0",
+		}
+		helperNote, err := client.CreateNote(noteMeta)
+		if err != nil {
+			return
+		}
+		helperID, _ = helperNote["id"].(string)
+		connMeta := BuildConnectorPayload(helperID, qnoteID)
+		_, _ = client.CreateConnector(connMeta)
+		log.Printf("[helper-note] Created persona waiting helper note and connector for Qnote %s.", qnoteID)
+	}
+	// Track the helper note ID for this Qnote
+	qnoteHelperNotes.Store(qnoteID, helperID)
+	updateResp, _ := client.UpdateNote(qnoteID, map[string]interface{}{"background_color": "#ffe4b3"})
+	exactAmber, _ := updateResp["background_color"].(string)
+	log.Printf("[monitor] Qnote color set to: %q for noteID: %s", exactAmber, qnoteID)
 }
 
 // HandleAIQuestion encapsulates the Q&A workflow for a New_AI_Question trigger.
 func HandleAIQuestion(ctx context.Context, client *canvusapi.Client, trig canvus.WidgetEvent, chatTokenLimit int) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[panic] HandleAIQuestion panic: %v", r)
+			return
 		}
 	}()
-	log.Printf("[trigger] HandleAIQuestion called: noteID=%s, trigger=%+v, chatTokenLimit=%d", trig.ID, trig, chatTokenLimit)
+	log.Printf("[trigger] HandleAIQuestion called: noteID=%s", trig.ID)
 	noteID := trig.ID
 	if IsQnoteProcessing(noteID) {
-		log.Printf("[step] Exiting HandleAIQuestion after IsQnoteProcessing for noteID: %s", noteID)
 		return
 	}
 	if !CheckPersonasPresent(noteID, client) {
-		log.Printf("[step] Personas missing, attempting to create personas for noteID: %s", noteID)
-		err := CreatePersonas(ctx, client)
+		EnsureHelperNoteForPersonas(noteID, client)
+		err := CreatePersonas(ctx, noteID, client)
 		if err != nil {
-			log.Printf("[error] CreatePersonas failed: %v", err)
+			// Remove the helper note if persona generation failed
+			if val, ok := qnoteHelperNotes.Load(noteID); ok {
+				helperID := val.(string)
+				_ = client.DeleteNote(helperID)
+				log.Printf("[helper-note] Deleted persona waiting helper note %s for Qnote %s.", helperID, noteID)
+				qnoteHelperNotes.Delete(noteID)
+			}
 			return
 		}
-		// Re-check after creation
 		if !CheckPersonasPresent(noteID, client) {
-			log.Printf("[error] Personas still missing after CreatePersonas for noteID: %s", noteID)
+			if val, ok := qnoteHelperNotes.Load(noteID); ok {
+				helperID := val.(string)
+				_ = client.DeleteNote(helperID)
+				log.Printf("[helper-note] Deleted persona waiting helper note %s for Qnote %s.", helperID, noteID)
+				qnoteHelperNotes.Delete(noteID)
+			}
 			return
+		}
+		// Remove the helper note after personas are created
+		if val, ok := qnoteHelperNotes.Load(noteID); ok {
+			helperID := val.(string)
+			_ = client.DeleteNote(helperID)
+			log.Printf("[helper-note] Deleted persona waiting helper note %s for Qnote %s.", helperID, noteID)
+			qnoteHelperNotes.Delete(noteID)
 		}
 	}
 	if !CheckQuestionPresent(noteID, client) {
-		log.Printf("[step] Exiting HandleAIQuestion after CheckQuestionPresent for noteID: %s", noteID)
 		EnsureHelperNoteForQuestion(noteID, client)
 		ch := make(chan struct{})
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		go func() {
-			log.Printf("[monitor] Starting per-Qnote event subscription for noteID: %s", noteID)
 			for {
 				select {
 				case <-ctx.Done():
@@ -424,7 +459,6 @@ func HandleAIQuestion(ctx context.Context, client *canvusapi.Client, trig canvus
 				default:
 					qWidget, err := client.GetNote(noteID, false)
 					if err != nil {
-						log.Printf("[monitor] Failed to fetch Qnote %s: %v", noteID, err)
 						time.Sleep(1 * time.Second)
 						continue
 					}
@@ -438,7 +472,7 @@ func HandleAIQuestion(ctx context.Context, client *canvusapi.Client, trig canvus
 				}
 			}
 		}()
-		<-ch // Block until signaled by per-Qnote monitor
+		<-ch
 		log.Printf("[step] Resuming HandleAIQuestion for noteID: %s after question detected", noteID)
 	}
 	OnQuestionDetected(noteID, client, chatTokenLimit)

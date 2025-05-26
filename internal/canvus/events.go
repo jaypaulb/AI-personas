@@ -126,18 +126,11 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 				log.Printf("[event] Skipping malformed line: %s", string(line))
 				continue // skip malformed lines
 			}
-			if debugMode {
-				log.Printf("[event] %s", string(line))
-			}
 			for _, raw := range events {
 				widType, _ := raw["widget_type"].(string)
 				id, _ := raw["id"].(string)
 				title, _ := raw["title"].(string)
 				text, _ := raw["text"].(string)
-
-				if debugMode {
-					log.Printf("[debug] Checking event: widget_type=%q, title=%q", widType, title)
-				}
 
 				widget := WidgetEvent{
 					ID:    id,
@@ -150,8 +143,6 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 				// Flexible BAC_Complete image trigger (case-insensitive, ignores .png)
 				imageTitle := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(title), ".png"))
 				if widType == "Image" && imageTitle == "bac_complete" {
-					jsonRaw, _ := json.MarshalIndent(raw, "", "  ")
-					log.Printf("[trigger] BAC_Complete image detected:\n%s\n", string(jsonRaw))
 					triggers <- EventTrigger{Type: TriggerBACCompleteImage, Widget: widget}
 					continue
 				}
@@ -161,8 +152,6 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 					bg, _ := raw["background_color"].(string)
 					bgLower := strings.ToLower(strings.TrimSpace(bg))
 					if bgLower == "#ffffffff" || bgLower == "#ffffff" {
-						jsonRaw, _ := json.MarshalIndent(raw, "", "  ")
-						log.Printf("[trigger] New_AI_Question detected:\n%s\n", string(jsonRaw))
 						triggers <- EventTrigger{Type: TriggerNewAIQuestion, Widget: widget}
 					}
 					continue
@@ -170,22 +159,14 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 
 				// Detect Create_Personas note
 				if widType == "Note" && strings.TrimSpace(title) == "Create_Personas" {
-					jsonRaw, _ := json.MarshalIndent(raw, "", "  ")
-					log.Printf("[trigger] Create_Personas Note detected:\n%s\n", string(jsonRaw))
 					triggers <- EventTrigger{Type: TriggerCreatePersonasNote, Widget: widget}
 					continue
-				}
-
-				// Log every note event for diagnostics
-				if widType == "Note" && id != "" {
-					log.Printf("[event] Note event: id=%s, title=%s, color(raw)=%q, text=%q", id, title, raw["background_color"], text)
 				}
 
 				// Only process and log Qnote events for New_AI_Question notes
 				if widType == "Note" && id != "" && strings.EqualFold(title, "New_AI_Question") {
 					bg, _ := raw["background_color"].(string)
 					bgLower := strings.ToLower(strings.TrimSpace(bg))
-					log.Printf("[debug] QNOTE event: id=%s, title=%s, color(raw)=%q, color(lower)=%q, text=%q", id, title, bg, bgLower, text)
 					if handlerRaw, ok := qnoteQuestionHandlers.Load(id); ok {
 						entry := handlerRaw.(struct {
 							color   string
@@ -193,10 +174,6 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 						})
 						expectedColor := strings.ToLower(strings.TrimSpace(entry.color))
 						colorMatch := bgLower == expectedColor
-						if !colorMatch {
-							log.Printf("[debug] QNOTE color mismatch for noteID=%s: got %q, expected %q", id, bgLower, expectedColor)
-						}
-						log.Printf("[debug] QNOTE handler found for noteID=%s | colorMatch: %v | expectedColor: %q", id, colorMatch, expectedColor)
 						if colorMatch {
 							// Debounce logic: store latest event and reset timer
 							qnoteLatestEvents.Store(id, widget)
@@ -204,18 +181,14 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 								timerRaw.(*time.Timer).Stop()
 							}
 							timer := time.AfterFunc(qnoteDebounceDuration, func() {
-								log.Printf("[debug] [debounce] QNOTE debounce timer fired for noteID=%s", id)
 								// On debounce expiry, check if latest event is a question
 								val, ok := qnoteLatestEvents.Load(id)
 								if !ok {
-									log.Printf("[debug] [debounce] QNOTE no latest event for noteID=%s", id)
 									return
 								}
 								latestWidget := val.(WidgetEvent)
 								isQ := IsQuestion(latestWidget.Text)
-								log.Printf("[debug] [debounce] QNOTE IsQuestion for noteID=%s | IsQuestion: %v (input: %q)", id, isQ, latestWidget.Text)
 								if isQ {
-									log.Printf("[trigger] [debounce] QNOTE question detected for noteID=%s", id)
 									triggers <- EventTrigger{Type: TriggerQnoteQuestionDetected, Widget: latestWidget}
 									entry.handler(latestWidget)
 								}
