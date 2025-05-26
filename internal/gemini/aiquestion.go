@@ -367,7 +367,7 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 			}
 			if noteCount > 0 {
 				anchorPayload := map[string]interface{}{
-					"anchor_name": question,
+					"anchor_name": question + " (Script Made)",
 					"location":    map[string]interface{}{"x": minX, "y": minY},
 					"size":        map[string]interface{}{"width": maxX - minX, "height": maxY - minY},
 					"notes":       allNoteIDs,

@@ -301,7 +301,7 @@ func startWebServer(client *canvusapi.Client) {
 			}
 			if !segmentFound {
 				w.WriteHeader(409)
-				w.Write([]byte("No free segments available in anchor zone"))
+				w.Write([]byte("Anchor is full: no free segments available."))
 				return
 			}
 			// Center of the segment
