@@ -137,6 +137,7 @@ func createAndPlaceQRCode(client *canvusapi.Client, webURL, qrPath string) (stri
 			return "", err
 		}
 		log.Printf("[web] QR code image uploaded to Remote anchor.")
+		log.Printf("[web][QRCODE] Remote access URL established: %s", webURL)
 		if id, ok := imgWidget["id"].(string); ok {
 			return id, nil
 		}
