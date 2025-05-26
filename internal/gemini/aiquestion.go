@@ -207,7 +207,8 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 		question = question[idx+3:]
 	}
 	question = strings.TrimSpace(strings.Split(question, "Please wait")[0])
-	spacing := qw / 5.0
+	spacing := (qw * scale) / 5.0
+	log.Printf("[AnswerQuestion] Spacing set to %.4f units (qw=%.4f * scale=%.4f / 5.0)", spacing, qw, scale)
 	// Layout: center (Q), top (A1), right (A2), bottom (A3), left (A4), then diagonals for meta
 	answerPositions := [][2]int{{0, -1}, {1, 0}, {0, 1}, {-1, 0}} // top, right, bottom, left
 	metaPositions := [][2]int{{1, -1}, {1, 1}, {-1, 1}, {-1, -1}} // top-right, bottom-right, bottom-left, top-left
@@ -232,8 +233,8 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 	// 2. Create answer notes (sequential, after all answers are ready)
 	for i, p := range personas {
 		pos := answerPositions[i]
-		ansX := qx + float64(pos[0])*(qw+spacing)
-		ansY := qy + float64(pos[1])*(qh+spacing)
+		ansX := qx + float64(pos[0])*((qw*scale)+spacing)
+		ansY := qy + float64(pos[1])*((qh*scale)+spacing)
 		noteMeta := map[string]interface{}{
 			"title":            p.Name + " Answer",
 			"text":             answers[i],
@@ -280,8 +281,8 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 	// 4. Create meta answer notes (sequential, after all meta-answers are ready)
 	for i, p := range personas {
 		metaPos := metaPositions[i]
-		metaX := qx + float64(metaPos[0])*(qw+spacing)
-		metaY := qy + float64(metaPos[1])*(qh+spacing)
+		metaX := qx + float64(metaPos[0])*((qw*scale)+spacing)
+		metaY := qy + float64(metaPos[1])*((qh*scale)+spacing)
 		metaMeta := map[string]interface{}{
 			"title":            p.Name + " Meta Answer",
 			"text":             metaAnswers[i],

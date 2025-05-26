@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -15,10 +16,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Showmax/go-fqdn"
 	"github.com/jaypaulb/AI-personas/canvusapi"
 	"github.com/jaypaulb/AI-personas/internal/canvus"
 	"github.com/jaypaulb/AI-personas/internal/gemini"
 	"github.com/joho/godotenv"
+	"github.com/skip2/go-qrcode"
 )
 
 var debugMode = false // Set to true for verbose debug logging
@@ -73,6 +76,268 @@ func housekeepingCheckAPIKeys() error {
 	return nil
 }
 
+// Helper to create QR code and return widget ID
+func createAndPlaceQRCode(client *canvusapi.Client, webURL, qrPath string) (string, error) {
+	log.Printf("[web] Generating QR code for URL: %s", webURL)
+	err := qrcode.WriteFile(webURL, qrcode.Medium, 256, qrPath)
+	if err != nil {
+		log.Printf("[web][error] Failed to generate QR code: %v", err)
+		return "", err
+	}
+	log.Printf("[web] QR code generated at %s", qrPath)
+
+	widgets, err := client.GetWidgets(false)
+	if err != nil {
+		log.Printf("[web][error] Failed to fetch widgets for QR cleanup: %v", err)
+		return "", err
+	}
+	for _, w := range widgets {
+		if w["widget_type"] == "Image" && w["title"] == "Remote QR" {
+			if id, ok := w["id"].(string); ok {
+				if delErr := client.DeleteImage(id); delErr != nil {
+					log.Printf("[web][error] Failed to delete old QR image (ID: %s): %v", id, delErr)
+				} else {
+					log.Printf("[web] Deleted old QR image (ID: %s)", id)
+				}
+			}
+		}
+	}
+
+	// Find the Remote anchor zone
+	var remoteAnchor map[string]interface{}
+	for _, w := range widgets {
+		typeStr, _ := w["widget_type"].(string)
+		anchorName, _ := w["anchor_name"].(string)
+		if typeStr == "Anchor" && strings.EqualFold(strings.TrimSpace(anchorName), "Remote") {
+			remoteAnchor = w
+			break
+		}
+	}
+	if remoteAnchor != nil {
+		anchorLoc, _ := remoteAnchor["location"].(map[string]interface{})
+		anchorSize, _ := remoteAnchor["size"].(map[string]interface{})
+		ax := anchorLoc["x"].(float64)
+		ay := anchorLoc["y"].(float64)
+		aw := anchorSize["width"].(float64)
+		ah := anchorSize["height"].(float64)
+		// QR code: 5% of zone area, top-left
+		qrW := aw / 20.0
+		qrH := ah / 20.0
+		qrX := ax
+		qrY := ay
+		imgMeta := map[string]interface{}{
+			"title":    "Remote QR",
+			"location": map[string]interface{}{"x": qrX, "y": qrY},
+			"size":     map[string]interface{}{"width": qrW, "height": qrH},
+		}
+		log.Printf("[web] Uploading QR code image to Remote anchor at (x=%.3f, y=%.3f, w=%.3f, h=%.3f)", qrX, qrY, qrW, qrH)
+		imgWidget, err := client.CreateImage(qrPath, imgMeta)
+		if err != nil {
+			log.Printf("[web][error] Failed to upload QR code image: %v", err)
+			return "", err
+		}
+		log.Printf("[web] QR code image uploaded to Remote anchor.")
+		if id, ok := imgWidget["id"].(string); ok {
+			return id, nil
+		}
+		return "", fmt.Errorf("QR code image widget ID not found")
+	} else {
+		log.Printf("[web][warn] Remote anchor not found; QR code not uploaded.")
+		return "", fmt.Errorf("Remote anchor not found")
+	}
+}
+
+func startQRCodeWatcher(client *canvusapi.Client, webURL, qrPath string) {
+	go func() {
+		for {
+			qrID, err := createAndPlaceQRCode(client, webURL, qrPath)
+			if err != nil {
+				log.Printf("[web][error] Could not create initial QR code: %v", err)
+				return
+			}
+			log.Printf("[web] Subscribing to QR code widget ID: %s", qrID)
+			// Subscribe to the QR code widget events
+			for {
+				widget, err := client.GetWidget(qrID, true)
+				if err != nil {
+					log.Printf("[web][error] Subscription to QR code widget failed: %v", err)
+					break // Try to recreate QR code
+				}
+				// If widget is nil or deleted, break and recreate
+				if widget == nil {
+					log.Printf("[web] QR code widget deleted (ID: %s), recreating...", qrID)
+					break
+				}
+				// If widget has a "deleted" flag or similar, break and recreate
+				// (Assume stream closes on delete)
+			}
+			// Loop to recreate QR code
+		}
+	}()
+}
+
+func startWebServer(client *canvusapi.Client) {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = os.Getenv("WEB_PORT")
+	}
+	if port == "" {
+		port = "8080"
+	}
+	fqdn, err := fqdn.FqdnHostname()
+	if err != nil || fqdn == "" {
+		fqdn, _ = os.Hostname()
+	}
+	webURL := "http://" + fqdn + ":" + port + "/"
+	qrPath := "qr_remote.png"
+
+	startQRCodeWatcher(client, webURL, qrPath)
+
+	log.Printf("[web] Starting web server on :%s (FQDN: %s)", port, fqdn)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "text/html")
+			// Serve static/question.html
+			f, err := os.Open("static/question.html")
+			if err != nil {
+				w.WriteHeader(500)
+				w.Write([]byte("Question page not found. Please contact admin."))
+				return
+			}
+			defer f.Close()
+			io.Copy(w, f)
+			return
+		}
+		if r.Method == http.MethodPost {
+			err := r.ParseForm()
+			if err != nil {
+				w.WriteHeader(400)
+				w.Write([]byte("Invalid form"))
+				return
+			}
+			question := r.FormValue("question")
+			if question == "" {
+				w.WriteHeader(400)
+				w.Write([]byte("Question required"))
+				return
+			}
+
+			// Ensure the question ends with a '?'
+			question = strings.TrimSpace(question)
+			if !strings.HasSuffix(question, "?") {
+				question = question + "?"
+			}
+
+			// Find the Remote anchor zone again (in case widgets changed)
+			widgets, err := client.GetWidgets(false)
+			if err != nil {
+				w.WriteHeader(500)
+				w.Write([]byte("Failed to fetch widgets"))
+				return
+			}
+			var remoteAnchor map[string]interface{}
+			for _, wgt := range widgets {
+				typeStr, _ := wgt["widget_type"].(string)
+				anchorName, _ := wgt["anchor_name"].(string)
+				if typeStr == "Anchor" && strings.EqualFold(strings.TrimSpace(anchorName), "Remote") {
+					remoteAnchor = wgt
+					break
+				}
+			}
+			if remoteAnchor == nil {
+				w.WriteHeader(500)
+				w.Write([]byte("Remote anchor not found"))
+				return
+			}
+			anchorLoc, _ := remoteAnchor["location"].(map[string]interface{})
+			anchorSize, _ := remoteAnchor["size"].(map[string]interface{})
+			ax := anchorLoc["x"].(float64)
+			ay := anchorLoc["y"].(float64)
+			aw := anchorSize["width"].(float64)
+			ah := anchorSize["height"].(float64)
+
+			cols, rows := 5, 4
+			segW := aw / float64(cols)
+			segH := ah / float64(rows)
+
+			// Build a 5x4 grid of segments (segment 0 is for QR code)
+			used := make([]bool, cols*rows)
+			for _, wgt := range widgets {
+				if wgt["widget_type"] != "Note" && wgt["widget_type"] != "Image" {
+					continue
+				}
+				loc, lok := wgt["location"].(map[string]interface{})
+				size, sok := wgt["size"].(map[string]interface{})
+				if !lok || !sok {
+					continue
+				}
+				wx, _ := loc["x"].(float64)
+				wy, _ := loc["y"].(float64)
+				ww, _ := size["width"].(float64)
+				wh, _ := size["height"].(float64)
+				for row := 0; row < rows; row++ {
+					for col := 0; col < cols; col++ {
+						segX := ax + float64(col)*segW
+						segY := ay + float64(row)*segH
+						// Check for overlap (simple AABB)
+						if wx < segX+segW && wx+ww > segX && wy < segY+segH && wy+wh > segY {
+							used[row*cols+col] = true
+						}
+					}
+				}
+			}
+			// Segment 0 (row 0, col 0) is reserved for QR code
+			used[0] = true
+			segmentFound := false
+			var segCol, segRow int
+			for i := 1; i < cols*rows; i++ {
+				if !used[i] {
+					segCol = i % cols
+					segRow = i / cols
+					segmentFound = true
+					break
+				}
+			}
+			if !segmentFound {
+				w.WriteHeader(409)
+				w.Write([]byte("No free segments available in anchor zone"))
+				return
+			}
+			// Center of the segment
+			noteX := ax + float64(segCol)*segW + segW/2
+			noteY := ay + float64(segRow)*segH + segH/2
+			// Note size is 2/3 of the segment size
+			noteW := segW * (2.0 / 3.0)
+			noteH := segH * (2.0 / 3.0)
+			// Scale so that the note appears the same size onscreen (scale = 1.5x previous value)
+			scale := 1.5 / 3.5
+			noteMeta := map[string]interface{}{
+				"title":            "New_AI_Question",
+				"text":             question,
+				"location":         map[string]interface{}{"x": noteX - noteW*scale/2, "y": noteY - noteH*scale/2},
+				"size":             map[string]interface{}{"width": noteW, "height": noteH},
+				"scale":            scale,
+				"background_color": "#FFFFFFFF",
+			}
+			_, err = client.CreateNote(noteMeta)
+			if err != nil {
+				w.WriteHeader(500)
+				w.Write([]byte("Failed to create note: " + err.Error()))
+				return
+			}
+
+			w.Write([]byte("Question submitted!"))
+			return
+		}
+		w.WriteHeader(405)
+	})
+	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
+	go func() {
+		log.Printf("[web] Listening on :%s (FQDN: %s)", port, fqdn)
+		http.ListenAndServe(":"+port, nil)
+	}()
+}
+
 func main() {
 	cwd, _ := os.Getwd()
 	absEnvPath := filepath.Join(cwd, ".env")
@@ -102,6 +367,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to initialize Canvus client: %v", err)
 	}
+	startWebServer(client)
 
 	eventMonitor := canvus.NewEventMonitor(client)
 	ctx, cancel := context.WithCancel(context.Background())
