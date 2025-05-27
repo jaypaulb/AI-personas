@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -110,7 +111,7 @@ Business Context:
 // FormatPersonaNote formats a persona for a Canvus note
 func FormatPersonaNote(p Persona) string {
 	return fmt.Sprintf(
-		"🧑 Name: %s\n\n💼 Role: %s\n\n📝 Description: %s\n\n🏫 Background: %s\n\n🎯 Goals: %s\n\n🎂 Age: %s\n\n⚧ Sex: %s\n\n🌍 Race: %s",
+		"🧑 Name: %s\n\n💼 Role: %s\n\n📝 Description: %s\n\n�� Background: %s\n\n🎯 Goals: %s\n\n🎂 Age: %s\n\n⚧ Sex: %s\n\n🌍 Race: %s",
 		p.Name, p.Role, p.Description, p.Background, p.Goals, string(p.Age), p.Sex, p.Race,
 	)
 }
@@ -126,6 +127,7 @@ type PersonaSession struct {
 type SessionManager struct {
 	sessions map[string]*PersonaSession
 	client   *genai.Client
+	mu       sync.Mutex // Add mutex for concurrent access
 }
 
 // NewSessionManager creates a new session manager.
@@ -167,6 +169,8 @@ When asked a question or provided with some info, you must only respond as the p
 
 // GetOrCreateSession returns the session for a persona, creating it if needed.
 func (sm *SessionManager) GetOrCreateSession(ctx context.Context, persona Persona, businessContext string) (*PersonaSession, error) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
 	if sess, ok := sm.sessions[persona.Name]; ok {
 		return sess, nil
 	}

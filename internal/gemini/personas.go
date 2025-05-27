@@ -4,12 +4,57 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/jaypaulb/AI-personas/canvusapi"
 )
+
+// PersonaNoteIDs stores persona note IDs per QnoteID
+var PersonaNoteIDs sync.Map // map[qnoteID][]string
+
+// ParsePersonaNote parses a persona note text into a Persona struct
+func ParsePersonaNote(text string) Persona {
+	p := Persona{}
+	// Use regex to extract fields
+	re := regexp.MustCompile(`(?m)^🧑 Name: (.*)$.*^💼 Role: (.*)$.*^📝 Description: (.*)$.*^🏫 Background: (.*)$.*^🎯 Goals: (.*)$.*^🎂 Age: (.*)$.*^⚧ Sex: (.*)$.*^🌍 Race: (.*)$`)
+	matches := re.FindStringSubmatch(text)
+	if len(matches) == 9 {
+		p.Name = matches[1]
+		p.Role = matches[2]
+		p.Description = matches[3]
+		p.Background = matches[4]
+		p.Goals = matches[5]
+		p.Age = AgeString(matches[6])
+		p.Sex = matches[7]
+		p.Race = matches[8]
+	}
+	return p
+}
+
+// FetchPersonasFromNotes fetches persona notes by IDs and parses them
+func FetchPersonasFromNotes(qnoteID string, client *canvusapi.Client) ([]Persona, error) {
+	idsAny, ok := PersonaNoteIDs.Load(qnoteID)
+	if !ok {
+		return nil, fmt.Errorf("no persona note IDs for Qnote %s", qnoteID)
+	}
+	ids, ok := idsAny.([]string)
+	if !ok || len(ids) != 4 {
+		return nil, fmt.Errorf("invalid persona note IDs for Qnote %s", qnoteID)
+	}
+	personas := make([]Persona, 0, 4)
+	for _, id := range ids {
+		note, err := client.GetNote(id, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch persona note %s: %w", id, err)
+		}
+		text, _ := note["text"].(string)
+		personas = append(personas, ParsePersonaNote(text))
+	}
+	return personas, nil
+}
 
 // CreatePersonas extracts business notes, generates personas, and creates persona notes and images on the canvas.
 // Returns error if any required step fails.
@@ -112,12 +157,16 @@ func CreatePersonas(ctx context.Context, qnoteID string, client *canvusapi.Clien
 
 	if len(existingPersonas) == 4 {
 		fmt.Printf("All 4 persona notes already exist. Using existing data.\n")
+		personaIDs := make([]string, 4)
 		for i := 0; i < 4; i++ {
 			w := existingPersonas[i]
-			title, _ := w["title"].(string)
 			text, _ := w["text"].(string)
-			fmt.Printf("Existing %s: %s\n", title, text)
+			id, _ := w["id"].(string)
+			personaIDs[i] = id
+			p := ParsePersonaNote(text)
+			fmt.Printf("Existing Persona: %s\n", p.Name)
 		}
+		PersonaNoteIDs.Store(qnoteID, personaIDs)
 		return nil
 	}
 
@@ -147,8 +196,11 @@ func CreatePersonas(ctx context.Context, qnoteID string, client *canvusapi.Clien
 	gap := 0.01
 	imgH := 0.10
 	var imgWg sync.WaitGroup
+	var personaIDs []string
 	for i := 0; i < 4; i++ {
-		if _, exists := existingPersonas[i]; exists {
+		if w, exists := existingPersonas[i]; exists {
+			id, _ := w["id"].(string)
+			personaIDs = append(personaIDs, id)
 			continue // Skip existing
 		}
 		p := personas[i]
@@ -178,6 +230,7 @@ func CreatePersonas(ctx context.Context, qnoteID string, client *canvusapi.Clien
 			fmt.Printf("[CreatePersonas] Failed to create persona note: %v\n", err)
 		} else {
 			noteWidgetID, _ := noteWidget["id"].(string)
+			personaIDs = append(personaIDs, noteWidgetID)
 			fmt.Printf("[CreatePersonas] Persona note created: %s (ID: %s)\n", title, noteWidgetID)
 		}
 		// Start image generation/upload in a goroutine
@@ -222,5 +275,10 @@ func CreatePersonas(ctx context.Context, qnoteID string, client *canvusapi.Clien
 	}
 	fmt.Printf("[CreatePersonas] Persona image generation running in background.\n")
 	// --- end Gemini persona generation ---
+
+	// Store persona note IDs for this Qnote
+	if len(personaIDs) == 4 {
+		PersonaNoteIDs.Store(qnoteID, personaIDs)
+	}
 	return nil
 }

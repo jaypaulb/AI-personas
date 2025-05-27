@@ -178,15 +178,31 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 	}()
 	qWidget, _ := client.GetNote(qnoteID, false)
 	currText, _ := qWidget["text"].(string)
-	personas := []Persona{}
 	geminiClient, err := NewClient(ctx)
 	if err != nil {
 		return
 	}
-	err = CreatePersonas(ctx, qnoteID, client)
-	if err != nil {
-		log.Printf("[AnswerQuestion] CreatePersonas failed: %v", err)
-		return
+	// Ensure personas exist and get their IDs
+	if _, ok := PersonaNoteIDs.Load(qnoteID); !ok {
+		err = CreatePersonas(ctx, qnoteID, client)
+		if err != nil {
+			log.Printf("[AnswerQuestion] CreatePersonas failed: %v", err)
+			return
+		}
+	}
+	personas, err := FetchPersonasFromNotes(qnoteID, client)
+	if err != nil || len(personas) != 4 {
+		// Try to recreate personas if any are missing
+		err = CreatePersonas(ctx, qnoteID, client)
+		if err != nil {
+			log.Printf("[AnswerQuestion] CreatePersonas failed: %v", err)
+			return
+		}
+		personas, err = FetchPersonasFromNotes(qnoteID, client)
+		if err != nil || len(personas) != 4 {
+			log.Printf("[AnswerQuestion] Could not fetch personas after CreatePersonas: %v", err)
+			return
+		}
 	}
 	colors := []string{"#2196f3ff", "#4caf50ff", "#ff9800ff", "#9c27b0ff"}
 	qLoc, _ := qWidget["location"].(map[string]interface{})
