@@ -26,4 +26,6 @@
 Thumbs.db
 
 # Env files
-.env 
+.env
+
+qr_remote.png 
