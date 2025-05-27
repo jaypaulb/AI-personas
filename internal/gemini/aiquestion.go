@@ -183,8 +183,9 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 	if err != nil {
 		return
 	}
-	personas, err = geminiClient.GeneratePersonas(ctx, "Q&A context")
+	err = CreatePersonas(ctx, qnoteID, client)
 	if err != nil {
+		log.Printf("[AnswerQuestion] CreatePersonas failed: %v", err)
 		return
 	}
 	colors := []string{"#2196f3ff", "#4caf50ff", "#ff9800ff", "#9c27b0ff"}
@@ -539,4 +540,173 @@ func HandleAIQuestion(ctx context.Context, client *canvusapi.Client, trig canvus
 	OnQuestionDetected(noteID, client, chatTokenLimit)
 	log.Printf("[step] HandleAIQuestion completed for noteID: %s", noteID)
 	return
+}
+
+// HandleFollowupConnector handles creation of a follow-up answer note when a connector is created from a persona answer note to a question note.
+func HandleFollowupConnector(ctx context.Context, client *canvusapi.Client, connectorEvent canvus.WidgetEvent, chatTokenLimit int) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[HandleFollowupConnector] panic: %v", r)
+		}
+	}()
+	log.Printf("[HandleFollowupConnector] called: connectorID=%s", connectorEvent.ID)
+	// Extract src and dst IDs from connector data
+	src, srcOK := connectorEvent.Data["src"].(map[string]interface{})
+	dst, dstOK := connectorEvent.Data["dst"].(map[string]interface{})
+	if !srcOK || !dstOK {
+		log.Printf("[HandleFollowupConnector] src/dst missing in connector data")
+		return
+	}
+	srcID, srcIDOK := src["id"].(string)
+	dstID, dstIDOK := dst["id"].(string)
+	if !srcIDOK || !dstIDOK {
+		log.Printf("[HandleFollowupConnector] srcID/dstID missing or not string")
+		return
+	}
+	// Fetch src and dst widgets (not just notes)
+	srcWidget, err := client.GetWidget(srcID, false)
+	if err != nil {
+		log.Printf("[HandleFollowupConnector] failed to fetch src widget: %v", err)
+		return
+	}
+	dstWidget, err := client.GetWidget(dstID, false)
+	if err != nil {
+		log.Printf("[HandleFollowupConnector] failed to fetch dst widget: %v", err)
+		return
+	}
+	srcType, _ := srcWidget["widget_type"].(string)
+	dstType, _ := dstWidget["widget_type"].(string)
+	if srcType != "Note" {
+		log.Printf("[HandleFollowupConnector] src widget is not a Note (type=%s, id=%s)", srcType, srcID)
+		return
+	}
+	if dstType != "Note" {
+		log.Printf("[HandleFollowupConnector] dst widget is not a Note (type=%s, id=%s)", dstType, dstID)
+		return
+	}
+	// Now fetch as notes
+	srcNote := srcWidget
+	dstNote := dstWidget
+	// Check if src is a persona answer note (title ends with ' Answer' and color matches persona colors)
+	title, _ := srcNote["title"].(string)
+	bg, _ := srcNote["background_color"].(string)
+	personaColors := map[string]bool{"#2196f3ff": true, "#4caf50ff": true, "#ff9800ff": true, "#9c27b0ff": true}
+	if !strings.HasSuffix(title, " Answer") || !personaColors[strings.ToLower(bg)] {
+		log.Printf("[HandleFollowupConnector] src note is not a persona answer note (title/bg)")
+		return
+	}
+	// Check if dst is a note with a question
+	dstText, _ := dstNote["text"].(string)
+	if !strings.HasSuffix(strings.TrimSpace(dstText), "?") {
+		log.Printf("[HandleFollowupConnector] dst note does not contain a question")
+		return
+	}
+	// Improved persona name extraction
+	personaName := title
+	personaName = strings.TrimSuffix(personaName, " Followup Answer")
+	personaName = strings.TrimSuffix(personaName, " Meta Answer")
+	personaName = strings.TrimSuffix(personaName, " Answer")
+	personaName = strings.TrimSpace(personaName)
+	// Get locations and sizes
+	srcLoc, _ := srcNote["location"].(map[string]interface{})
+	srcX, _ := srcLoc["x"].(float64)
+	srcY, _ := srcLoc["y"].(float64)
+	dstLoc, _ := dstNote["location"].(map[string]interface{})
+	dstX, _ := dstLoc["x"].(float64)
+	dstY, _ := dstLoc["y"].(float64)
+	dstSize, _ := dstNote["size"].(map[string]interface{})
+	dstW, _ := dstSize["width"].(float64)
+	dstH, _ := dstSize["height"].(float64)
+	scale := 1.0
+	if s, ok := dstNote["scale"].(float64); ok {
+		scale = s
+	}
+	// Compute vector from dst to src
+	dx := srcX - dstX
+	dy := srcY - dstY
+	// Place follow-up note at same distance from dst as src is from dst
+	fupX := dstX + dx
+	fupY := dstY + dy
+	// Use same size as dst note
+	fupW := dstW
+	fupH := dstH
+	// Helper: If dst note is blank or not a question, create helper note
+	if strings.TrimSpace(dstText) == "" || !strings.HasSuffix(strings.TrimSpace(dstText), "?") {
+		helperTitle := "Helper: Please enter a question for this note"
+		noteMeta := map[string]interface{}{
+			"title":            helperTitle,
+			"text":             "Please enter a question in the note to enable follow-up.",
+			"location":         map[string]interface{}{"x": dstX - 1.2*dstW, "y": dstY - 0.33*dstH},
+			"size":             map[string]interface{}{"width": dstW, "height": dstH * 0.7},
+			"background_color": "#e0e0e0",
+		}
+		_, _ = client.CreateNote(noteMeta)
+		return
+	}
+	// Generate follow-up answer using the persona
+	personas := []Persona{}
+	geminiClient, err := NewClient(ctx)
+	if err != nil {
+		log.Printf("[HandleFollowupConnector] failed to create Gemini client: %v", err)
+		return
+	}
+	err = CreatePersonas(ctx, dstID, client)
+	if err != nil {
+		log.Printf("[HandleFollowupConnector] CreatePersonas failed: %v", err)
+		return
+	}
+	// Find the persona by name
+	var persona Persona
+	found := false
+	for _, p := range personas {
+		if p.Name == personaName {
+			persona = p
+			found = true
+			break
+		}
+	}
+	if !found {
+		log.Printf("[HandleFollowupConnector] persona not found: %s", personaName)
+		return
+	}
+	sessionManager := NewSessionManager(geminiClient.GenaiClient())
+	answer, _ := geminiClient.AnswerQuestion(ctx, persona, dstText, sessionManager, "")
+	if len(answer) > chatTokenLimit {
+		succinctPrompt := "Please rephrase your answer in a much more succinct, short, and verbal way. Limit your response to " + fmt.Sprintf("%d", chatTokenLimit) + " characters."
+		answer, _ = geminiClient.AnswerQuestion(ctx, persona, succinctPrompt, sessionManager, "")
+	}
+	// Create follow-up answer note
+	fupMeta := map[string]interface{}{
+		"title":            persona.Name + " Followup Answer",
+		"text":             answer,
+		"location":         map[string]interface{}{"x": fupX, "y": fupY},
+		"size":             map[string]interface{}{"width": fupW, "height": fupH},
+		"background_color": bg,
+		"scale":            scale,
+	}
+	fupNote, err := client.CreateNote(fupMeta)
+	if err != nil {
+		log.Printf("[HandleFollowupConnector] failed to create follow-up note: %v", err)
+		return
+	}
+	fupNoteID, _ := fupNote["id"].(string)
+	if fupNoteID == "" {
+		log.Printf("[HandleFollowupConnector] follow-up note ID missing")
+		return
+	}
+	// Create connector from dst to follow-up note, copying settings from original connector
+	connMeta := connectorEvent.Data
+	connMetaCpy := make(map[string]interface{})
+	for k, v := range connMeta {
+		connMetaCpy[k] = v
+	}
+	// Update src/dst for new connector
+	connMetaCpy["src"] = map[string]interface{}{"id": dstID, "auto_location": true, "tip": "none"}
+	connMetaCpy["dst"] = map[string]interface{}{"id": fupNoteID, "auto_location": true, "tip": "solid-equilateral-triangle"}
+	connMetaCpy["widget_type"] = "Connector"
+	_, err = client.CreateConnector(connMetaCpy)
+	if err != nil {
+		log.Printf("[HandleFollowupConnector] failed to create follow-up connector: %v", err)
+	}
+	log.Printf("[HandleFollowupConnector] Follow-up answer note and connector created for persona %s", persona.Name)
 }

@@ -37,20 +37,19 @@ func maskKey(key string) string {
 }
 
 func housekeepingCheckAPIKeys() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // Increased timeout for slow networks
 	defer cancel()
 	// 1. Gemini
 	geminiKey := os.Getenv("GEMINI_API_KEY")
+	log.Printf("[startup] GEMINI_API_KEY: %s", maskKey(geminiKey))
 	gClient, err := gemini.NewClient(ctx)
-	if err != nil {
+	if err != nil || gClient == nil {
 		return fmt.Errorf("Gemini API key check failed (key: %s): %w", maskKey(geminiKey), err)
 	}
-	// Make a real Gemini API call to catch expired/invalid keys
-	// Use a trivial prompt to minimize cost
-	_, err = gClient.GeneratePersonas(ctx, "health check")
-	if err != nil {
-		return fmt.Errorf("Gemini API key health check failed (key: %s): %w", maskKey(geminiKey), err)
+	if gClient.GenaiClient() == nil {
+		return fmt.Errorf("Gemini API client internal field is nil (key: %s)", maskKey(geminiKey))
 	}
+	log.Printf("[startup] Skipping personas health check: no noteID available for CreatePersonas.")
 	// 2. OpenAI
 	openaiKey := os.Getenv("OPENAI_API_KEY")
 	if openaiKey == "" {
@@ -422,6 +421,9 @@ func main() {
 					log.Printf("[main] Launching HandleAIQuestion goroutine for noteID=%s", trig.Widget.ID)
 					go gemini.HandleAIQuestion(ctx, client, trig.Widget, chatTokenLimit)
 				}
+			case canvus.TriggerConnectorCreated:
+				log.Printf("[main] TriggerConnectorCreated for connectorID=%s", trig.Widget.ID)
+				go gemini.HandleFollowupConnector(ctx, client, trig.Widget, chatTokenLimit)
 			}
 			if imagePatched && notePatched && noteTextExtracted != "" {
 				log.Printf("[main] Note text extracted after '?': %s\n", noteTextExtracted)

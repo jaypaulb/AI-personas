@@ -40,6 +40,7 @@ const (
 	TriggerNewAIQuestion
 	TriggerCreatePersonasNote
 	TriggerQnoteQuestionDetected
+	TriggerConnectorCreated
 )
 
 // EventTrigger represents a detected trigger event
@@ -160,6 +161,12 @@ func (em *EventMonitor) SubscribeAndDetectTriggers(ctx context.Context, triggers
 				// Detect Create_Personas note
 				if widType == "Note" && strings.TrimSpace(title) == "Create_Personas" {
 					triggers <- EventTrigger{Type: TriggerCreatePersonasNote, Widget: widget}
+					continue
+				}
+
+				// Detect Connector creation
+				if widType == "Connector" {
+					triggers <- EventTrigger{Type: TriggerConnectorCreated, Widget: widget}
 					continue
 				}
 
