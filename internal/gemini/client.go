@@ -111,7 +111,7 @@ Business Context:
 // FormatPersonaNote formats a persona for a Canvus note
 func FormatPersonaNote(p Persona) string {
 	return fmt.Sprintf(
-		"🧑 Name: %s\n\n💼 Role: %s\n\n📝 Description: %s\n\n�� Background: %s\n\n🎯 Goals: %s\n\n🎂 Age: %s\n\n⚧ Sex: %s\n\n🌍 Race: %s",
+		"🧑 Name: %s\n\n💼 Role: %s\n\n📝 Description: %s\n\n🏫 Background: %s\n\n🎯 Goals: %s\n\n🎂 Age: %s\n\n⚧ Sex: %s\n\n🌍 Race: %s",
 		p.Name, p.Role, p.Description, p.Background, p.Goals, string(p.Age), p.Sex, p.Race,
 	)
 }
