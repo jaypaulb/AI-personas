@@ -65,75 +65,11 @@ func CreatePersonas(ctx context.Context, qnoteID string, client *canvusapi.Clien
 		return fmt.Errorf("[CreatePersonas] Failed to fetch widgets: %w", err)
 	}
 
-	// Step 2: Filter business notes
-	requiredTitles := []string{
-		"KEY PARTNERS",
-		"KEY ACTIVITIES",
-		"VALUE PROPOSITIONS",
-		"CUSTOMER RELATIONSHIPS",
-		"CUSTOMER SEGMENTS",
-		"KEY RESOURCES",
-		"CHANNELS",
-		"COST STRUCTURE",
-		"REVENUE STREAMS",
+	// Use the helper to get business context and anchor
+	businessContext, personasAnchor, err := getBusinessContext(ctx, qnoteID, client)
+	if err != nil {
+		return fmt.Errorf("[CreatePersonas] Failed to get business context or anchor: %w", err)
 	}
-	titleMap := make(map[string]bool)
-	for _, t := range requiredTitles {
-		titleMap[t] = false
-	}
-	var businessNotes []map[string]interface{}
-	var personasAnchor map[string]interface{}
-	for _, w := range widgets {
-		typeStr, _ := w["widget_type"].(string)
-		title, _ := w["title"].(string)
-		titleUpper := strings.ToUpper(strings.TrimSpace(title))
-		if typeStr == "Note" && titleMap[titleUpper] == false {
-			for _, req := range requiredTitles {
-				if titleUpper == req {
-					businessNotes = append(businessNotes, w)
-					titleMap[req] = true
-					fmt.Printf("Extracted data from Note - %s\n", req)
-				}
-			}
-		}
-		if typeStr == "Anchor" {
-			anchorName, _ := w["anchor_name"].(string)
-			if strings.EqualFold(strings.TrimSpace(anchorName), "Personas") {
-				personasAnchor = w
-			}
-		}
-	}
-
-	missing := false
-	for _, req := range requiredTitles {
-		if !titleMap[req] {
-			fmt.Printf("Note - %s not found Aborting\n", req)
-			missing = true
-		}
-	}
-	if missing {
-		return fmt.Errorf("[CreatePersonas] Aborting extraction due to missing notes.")
-	}
-
-	if personasAnchor == nil {
-		return fmt.Errorf("[CreatePersonas] Personas anchor not found. Aborting.")
-	}
-
-	fmt.Printf("Successfully extracted all data - parsing and compiling report for AI\n")
-	// Step 3: Structure and log the data
-	structured := struct {
-		BusinessNotes  []string               `json:"business_notes"`
-		PersonasAnchor map[string]interface{} `json:"personas_anchor"`
-	}{
-		BusinessNotes:  []string{},
-		PersonasAnchor: personasAnchor,
-	}
-	for _, n := range businessNotes {
-		title, _ := n["title"].(string)
-		text, _ := n["text"].(string)
-		structured.BusinessNotes = append(structured.BusinessNotes, fmt.Sprintf("%s: %s", title, text))
-	}
-	businessContext := strings.Join(structured.BusinessNotes, "\n\n")
 
 	// --- Persona existence check ---
 	existingPersonas := make(map[int]map[string]interface{}) // index -> widget
@@ -184,7 +120,7 @@ func CreatePersonas(ctx context.Context, qnoteID string, client *canvusapi.Clien
 	// Color palette
 	colors := []string{"#2196f3ff", "#4caf50ff", "#ff9800ff", "#9c27b0ff"}
 	// Layout calculation
-	anchor := structured.PersonasAnchor
+	anchor := personasAnchor
 	anchorLoc, _ := anchor["location"].(map[string]interface{})
 	anchorSize, _ := anchor["size"].(map[string]interface{})
 	ax := anchorLoc["x"].(float64)
@@ -281,4 +217,82 @@ func CreatePersonas(ctx context.Context, qnoteID string, client *canvusapi.Clien
 		PersonaNoteIDs.Store(qnoteID, personaIDs)
 	}
 	return nil
+}
+
+// getBusinessContext extracts business notes and the personas anchor from the canvas.
+func getBusinessContext(ctx context.Context, qnoteID string, client *canvusapi.Client) (string, map[string]interface{}, error) {
+	widgets, err := client.GetWidgets(false)
+	if err != nil {
+		return "", nil, fmt.Errorf("Failed to fetch widgets: %w", err)
+	}
+
+	requiredTitles := []string{
+		"KEY PARTNERS",
+		"KEY ACTIVITIES",
+		"VALUE PROPOSITIONS",
+		"CUSTOMER RELATIONSHIPS",
+		"CUSTOMER SEGMENTS",
+		"KEY RESOURCES",
+		"CHANNELS",
+		"COST STRUCTURE",
+		"REVENUE STREAMS",
+	}
+	titleMap := make(map[string]bool)
+	for _, t := range requiredTitles {
+		titleMap[t] = false
+	}
+	var businessNotes []map[string]interface{}
+	var personasAnchor map[string]interface{}
+	for _, w := range widgets {
+		typeStr, _ := w["widget_type"].(string)
+		title, _ := w["title"].(string)
+		titleUpper := strings.ToUpper(strings.TrimSpace(title))
+		if typeStr == "Note" && titleMap[titleUpper] == false {
+			for _, req := range requiredTitles {
+				if titleUpper == req {
+					businessNotes = append(businessNotes, w)
+					titleMap[req] = true
+					fmt.Printf("Extracted data from Note - %s\n", req)
+				}
+			}
+		}
+		if typeStr == "Anchor" {
+			anchorName, _ := w["anchor_name"].(string)
+			if strings.EqualFold(strings.TrimSpace(anchorName), "Personas") {
+				personasAnchor = w
+			}
+		}
+	}
+
+	missing := false
+	for _, req := range requiredTitles {
+		if !titleMap[req] {
+			fmt.Printf("Note - %s not found Aborting\n", req)
+			missing = true
+		}
+	}
+	if missing {
+		return "", nil, fmt.Errorf("Aborting extraction due to missing notes.")
+	}
+
+	if personasAnchor == nil {
+		return "", nil, fmt.Errorf("Personas anchor not found. Aborting.")
+	}
+
+	fmt.Printf("Successfully extracted all data - parsing and compiling report for AI\n")
+	structured := struct {
+		BusinessNotes  []string               `json:"business_notes"`
+		PersonasAnchor map[string]interface{} `json:"personas_anchor"`
+	}{
+		BusinessNotes:  []string{},
+		PersonasAnchor: personasAnchor,
+	}
+	for _, n := range businessNotes {
+		title, _ := n["title"].(string)
+		text, _ := n["text"].(string)
+		structured.BusinessNotes = append(structured.BusinessNotes, fmt.Sprintf("%s: %s", title, text))
+	}
+	businessContext := strings.Join(structured.BusinessNotes, "\n\n")
+
+	return businessContext, personasAnchor, nil
 }
