@@ -3,6 +3,7 @@ package gemini
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"regexp"
 	"strings"
@@ -19,7 +20,7 @@ var PersonaNoteIDs sync.Map // map[qnoteID][]string
 func ParsePersonaNote(text string) Persona {
 	p := Persona{}
 	// Use regex to extract fields
-	re := regexp.MustCompile(`(?m)^🧑 Name: (.*)$.*^💼 Role: (.*)$.*^📝 Description: (.*)$.*^🏫 Background: (.*)$.*^🎯 Goals: (.*)$.*^🎂 Age: (.*)$.*^⚧ Sex: (.*)$.*^🌍 Race: (.*)$`)
+	re := regexp.MustCompile(`(?m)^🧑 Name: (.*)[\s\S]*^💼 Role: (.*)[\s\S]*^📝 Description: (.*)[\s\S]*^🏫 Background: (.*)[\s\S]*^🎯 Goals: (.*)[\s\S]*^🎂 Age: (.*)[\s\S]*^⚧ Sex: (.*)[\s\S]*^🌍 Race: (.*)$`)
 	matches := re.FindStringSubmatch(text)
 	if len(matches) == 9 {
 		p.Name = matches[1]
@@ -293,6 +294,13 @@ func getBusinessContext(ctx context.Context, qnoteID string, client *canvusapi.C
 		structured.BusinessNotes = append(structured.BusinessNotes, fmt.Sprintf("%s: %s", title, text))
 	}
 	businessContext := strings.Join(structured.BusinessNotes, "\n\n")
+
+	const minBusinessContextLength = 100 // Minimum useful length for business context
+	if len(strings.TrimSpace(businessContext)) < minBusinessContextLength {
+		log.Printf("Warning: Business context extracted but appears too short for AI (%d characters). Consider adding more details to your business notes.\n", len(strings.TrimSpace(businessContext)))
+	} else {
+		log.Printf("Successfully extracted all data - parsing and compiling report for AI\n")
+	}
 
 	return businessContext, personasAnchor, nil
 }

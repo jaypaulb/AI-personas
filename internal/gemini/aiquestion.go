@@ -226,7 +226,7 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 	question = strings.TrimSpace(strings.Split(question, "Please wait")[0])
 
 	// Get business context from CreatePersonas
-	_, businessContext, err := getBusinessContext(ctx, qnoteID, client)
+	businessContextStr, _, err := getBusinessContext(ctx, qnoteID, client)
 	if err != nil {
 		log.Printf("[AnswerQuestion] Failed to get business context: %v", err)
 		return // Or handle this error appropriately
@@ -246,10 +246,10 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 	for i, p := range personas {
 		go func(i int, p Persona) {
 			defer ansWg.Done()
-			answer, _ := geminiClient.AnswerQuestion(ctx, p, question, sessionManager, businessContext)
+			answer, _ := geminiClient.AnswerQuestion(ctx, p, question, sessionManager, businessContextStr)
 			if len(answer) > chatTokenLimit {
 				succinctPrompt := "Please rephrase your answer in a much more succinct, short, and verbal way. Limit your response to " + fmt.Sprintf("%d", chatTokenLimit) + " characters."
-				answer, _ = geminiClient.AnswerQuestion(ctx, p, succinctPrompt, sessionManager, businessContext)
+				answer, _ = geminiClient.AnswerQuestion(ctx, p, succinctPrompt, sessionManager, businessContextStr)
 			}
 			answers[i] = answer
 		}(i, p)
@@ -294,10 +294,10 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 				}
 			}
 			metaPrompt := fmt.Sprintf("Thank you %s for the interesting answer. Does what you heard from the others change what you think in any way? You heard: %s", p.Name, strings.Join(others, "; "))
-			metaAnswer, _ := geminiClient.AnswerQuestion(ctx, p, metaPrompt, sessionManager, businessContext)
+			metaAnswer, _ := geminiClient.AnswerQuestion(ctx, p, metaPrompt, sessionManager, businessContextStr)
 			if len(metaAnswer) > chatTokenLimit {
 				succinctPrompt := "Please rephrase your answer in a much more succinct, short, and verbal way. Limit your response to " + fmt.Sprintf("%d", chatTokenLimit) + " characters."
-				metaAnswer, _ = geminiClient.AnswerQuestion(ctx, p, succinctPrompt, sessionManager, businessContext)
+				metaAnswer, _ = geminiClient.AnswerQuestion(ctx, p, succinctPrompt, sessionManager, businessContextStr)
 			}
 			metaAnswers[i] = metaAnswer
 		}(i, p)
@@ -694,17 +694,17 @@ func HandleFollowupConnector(ctx context.Context, client *canvusapi.Client, conn
 		return
 	}
 	// Get business context for followup
-	_, businessContext, err := getBusinessContext(ctx, dstID, client)
+	businessContextStr, _, err := getBusinessContext(ctx, dstID, client)
 	if err != nil {
 		log.Printf("[HandleFollowupConnector] Failed to get business context: %v", err)
 		return // Or handle this error appropriately
 	}
 
 	sessionManager := NewSessionManager(geminiClient.GenaiClient())
-	answer, _ := geminiClient.AnswerQuestion(ctx, persona, dstText, sessionManager, businessContext)
+	answer, _ := geminiClient.AnswerQuestion(ctx, persona, dstText, sessionManager, businessContextStr)
 	if len(answer) > chatTokenLimit {
 		succinctPrompt := "Please rephrase your answer in a much more succinct, short, and verbal way. Limit your response to " + fmt.Sprintf("%d", chatTokenLimit) + " characters."
-		answer, _ = geminiClient.AnswerQuestion(ctx, persona, succinctPrompt, sessionManager, businessContext)
+		answer, _ = geminiClient.AnswerQuestion(ctx, persona, succinctPrompt, sessionManager, businessContextStr)
 	}
 	// Create follow-up answer note
 	fupMeta := map[string]interface{}{
