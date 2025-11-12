@@ -28,4 +28,6 @@ Thumbs.db
 # Env files
 .env
 
-qr_remote.png 
+qr_remote.png
+
+/dross/

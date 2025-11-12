@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -137,8 +139,61 @@ func createAndPlaceQRCode(client *canvusapi.Client, webURL, qrPath string) (stri
 		}
 		log.Printf("[web] QR code image uploaded to Remote anchor.")
 		log.Printf("[web][QRCODE] Remote access URL established: %s", webURL)
+
+		// Log the full CreateImage response to see what we're actually getting
+		responseJSON, _ := json.MarshalIndent(imgWidget, "", "  ")
+		log.Printf("[web][debug] CreateImage response: %s", string(responseJSON))
+
+		// Extract ID from response
+		extractedID := ""
 		if id, ok := imgWidget["id"].(string); ok {
-			return id, nil
+			extractedID = id
+			log.Printf("[web][debug] Extracted ID from CreateImage response: %s", extractedID)
+		} else {
+			log.Printf("[web][error] No 'id' field found in CreateImage response")
+		}
+
+		// Now fetch the actual widget by title to get the real widget ID
+		log.Printf("[web][debug] Fetching widgets via GetWidgets to verify ID...")
+		widgets, err := client.GetWidgets(false)
+		if err != nil {
+			log.Printf("[web][error] Failed to fetch widgets to verify ID: %v", err)
+			if extractedID != "" {
+				return extractedID, nil // Fallback to extracted ID
+			}
+			return "", fmt.Errorf("QR code image widget ID not found and cannot verify")
+		}
+
+		log.Printf("[web][debug] GetWidgets returned %d widgets", len(widgets))
+
+		// Find the QR code widget by title
+		var foundWidget map[string]interface{}
+		for _, w := range widgets {
+			if w["widget_type"] == "Image" && w["title"] == "Remote QR" {
+				foundWidget = w
+				if actualID, ok := w["id"].(string); ok {
+					// Log the full widget data
+					widgetJSON, _ := json.MarshalIndent(w, "", "  ")
+					log.Printf("[web][debug] Found Remote QR widget from GetWidgets:\n%s", string(widgetJSON))
+					log.Printf("[web][debug] Actual widget ID from GetWidgets: %s", actualID)
+					if actualID != extractedID {
+						log.Printf("[web][warning] ID MISMATCH! CreateImage returned: %s, but GetWidgets shows: %s", extractedID, actualID)
+					} else {
+						log.Printf("[web][debug] IDs match: %s", actualID)
+					}
+					return actualID, nil // Use the actual widget ID from GetWidgets
+				}
+			}
+		}
+
+		if foundWidget == nil {
+			log.Printf("[web][warning] Remote QR widget not found in GetWidgets response")
+		}
+
+		// If we can't find it, fallback to extracted ID or error
+		if extractedID != "" {
+			log.Printf("[web][warning] Could not find widget in GetWidgets, using extracted ID: %s", extractedID)
+			return extractedID, nil
 		}
 		return "", fmt.Errorf("QR code image widget ID not found")
 	} else {
@@ -149,29 +204,106 @@ func createAndPlaceQRCode(client *canvusapi.Client, webURL, qrPath string) (stri
 
 func startQRCodeWatcher(client *canvusapi.Client, webURL, qrPath string) {
 	go func() {
+		ctx := context.Background()
+		var qrID string
+
 		for {
-			qrID, err := createAndPlaceQRCode(client, webURL, qrPath)
-			if err != nil {
-				log.Printf("[web][error] Could not create initial QR code: %v", err)
-				return
-			}
-			log.Printf("[web] Subscribing to QR code widget ID: %s", qrID)
-			// Subscribe to the QR code widget events
-			for {
-				widget, err := client.GetWidget(qrID, true)
+			// Create QR code if we don't have one
+			if qrID == "" {
+				var err error
+				qrID, err = createAndPlaceQRCode(client, webURL, qrPath)
 				if err != nil {
-					log.Printf("[web][error] Subscription to QR code widget failed: %v", err)
-					break // Try to recreate QR code
+					log.Printf("[web][error] Could not create initial QR code: %v", err)
+					time.Sleep(5 * time.Second)
+					continue
 				}
-				// If widget is nil or deleted, break and recreate
-				if widget == nil {
-					log.Printf("[web] QR code widget deleted (ID: %s), recreating...", qrID)
+				log.Printf("[web] QR code created (ID: %s), starting subscription...", qrID)
+				// Wait a bit for the widget to be fully available before subscribing
+				time.Sleep(2 * time.Second)
+			}
+
+			// Subscribe to the QR code widget stream
+			stream, err := client.SubscribeToImage(ctx, qrID)
+			if err != nil {
+				log.Printf("[web][error] Failed to subscribe to QR code widget (ID: %s): %v", qrID, err)
+				// If subscription fails, clear ID to recreate
+				qrID = ""
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			log.Printf("[web] Subscribed to QR code widget (ID: %s)", qrID)
+
+			// Read from the subscription stream
+			r := bufio.NewReader(stream)
+			deleted := false
+
+			for {
+				line, err := r.ReadBytes('\n')
+				if err != nil {
+					if err == io.EOF {
+						// Stream ended - check if it was due to deletion
+						if !deleted {
+							log.Printf("[web] QR code subscription stream ended unexpectedly (ID: %s)", qrID)
+						}
+						stream.Close()
+						break
+					}
+					log.Printf("[web][error] Error reading QR code subscription stream: %v", err)
+					stream.Close()
 					break
 				}
-				// If widget has a "deleted" flag or similar, break and recreate
-				// (Assume stream closes on delete)
+
+				trimmed := strings.TrimSpace(string(line))
+				if trimmed == "" || trimmed == "\r" {
+					continue // skip keep-alive or empty lines
+				}
+
+				// Try parsing as a single widget event (map)
+				var widgetEvent map[string]interface{}
+				if err := json.Unmarshal(line, &widgetEvent); err == nil {
+					// Check if this is our widget and if it's deleted
+					if id, ok := widgetEvent["id"].(string); ok && id == qrID {
+						if state, ok := widgetEvent["state"].(string); ok && state == "deleted" {
+							log.Printf("[web] QR code widget deleted (ID: %s), will recreate...", qrID)
+							deleted = true
+							stream.Close()
+							qrID = "" // Clear ID to trigger recreation
+							break
+						}
+					}
+					// Ignore all other updates - we only care about deletion
+					continue
+				}
+
+				// Try parsing as an array of events
+				var events []map[string]interface{}
+				if err := json.Unmarshal(line, &events); err == nil {
+					for _, ev := range events {
+						if id, ok := ev["id"].(string); ok && id == qrID {
+							if state, ok := ev["state"].(string); ok && state == "deleted" {
+								log.Printf("[web] QR code widget deleted (ID: %s), will recreate...", qrID)
+								deleted = true
+								stream.Close()
+								qrID = "" // Clear ID to trigger recreation
+								break
+							}
+						}
+					}
+					if deleted {
+						break
+					}
+					continue
+				}
+
+				// If we can't parse it, just ignore it
 			}
-			// Loop to recreate QR code
+
+			// If we broke out of the loop and widget wasn't deleted, wait before retrying subscription
+			if !deleted && qrID != "" {
+				log.Printf("[web] QR code subscription ended, will resubscribe (ID: %s)", qrID)
+				time.Sleep(2 * time.Second)
+			}
 		}
 	}()
 }

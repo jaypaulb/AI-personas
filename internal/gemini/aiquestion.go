@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -170,6 +171,25 @@ func OnQuestionDetected(qnoteID string, client *canvusapi.Client, chatTokenLimit
 	AnswerQuestion(qnoteID, client, chatTokenLimit)
 }
 
+// getAnswerGenerationMessage returns the appropriate wait message based on the model type
+func getAnswerGenerationMessage() string {
+	model := os.Getenv("GEMINI_MODEL_CHAT")
+	if model == "" {
+		model = "gemini-2.5-flash" // Default
+	}
+	modelLower := strings.ToLower(model)
+
+	if strings.Contains(modelLower, "flash-lite") {
+		return "Generating answers, please wait... This can take up to 30 seconds."
+	} else if strings.Contains(modelLower, "flash") {
+		return "Generating answers, please wait... This can take up to 60 seconds."
+	} else if strings.Contains(modelLower, "pro") {
+		return "Generating answers, please wait... This could take a few minutes as the model thinks about its answers."
+	}
+	// Default message if model type can't be determined
+	return "Generating answers, please wait..."
+}
+
 // AnswerQuestion handles persona answers, meta-answers, note creation, and connectors.
 func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int) {
 	ctx := context.Background()
@@ -178,6 +198,58 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 	}()
 	qWidget, _ := client.GetNote(qnoteID, false)
 	currText, _ := qWidget["text"].(string)
+
+	// Get the appropriate wait message based on model type
+	waitMessage := getAnswerGenerationMessage()
+
+	// Create or update helper note to show "Generating answers, please wait..."
+	helperTitle := "Helper: Please enter a question for this note"
+	qLoc, _ := qWidget["location"].(map[string]interface{})
+	qSize, _ := qWidget["size"].(map[string]interface{})
+	qx := qLoc["x"].(float64)
+	qy := qLoc["y"].(float64)
+	qw := qSize["width"].(float64)
+	qh := qSize["height"].(float64)
+
+	var helperID string
+	widgets, err := client.GetWidgets(false)
+	if err == nil {
+		for _, w := range widgets {
+			typeStr, _ := w["widget_type"].(string)
+			title, _ := w["title"].(string)
+			if typeStr == "Note" && title == helperTitle {
+				helperID, _ = w["id"].(string)
+				// Update existing helper note
+				update := map[string]interface{}{
+					"text": waitMessage,
+				}
+				_, _ = client.UpdateNote(helperID, update)
+				qnoteHelperNotes.Store(qnoteID, helperID)
+				break
+			}
+		}
+	}
+	// If helper note doesn't exist, create it
+	if helperID == "" {
+		helperX := qx - 1.2*qw
+		helperY := qy - 0.33*qh
+		noteMeta := map[string]interface{}{
+			"title":            helperTitle,
+			"text":             waitMessage,
+			"location":         map[string]interface{}{"x": helperX, "y": helperY},
+			"size":             map[string]interface{}{"width": qw, "height": qh * 0.7},
+			"background_color": "#e0e0e0",
+		}
+		helperNote, err := client.CreateNote(noteMeta)
+		if err == nil {
+			helperID, _ = helperNote["id"].(string)
+			connMeta := BuildConnectorPayload(helperID, qnoteID)
+			_, _ = client.CreateConnector(connMeta)
+			qnoteHelperNotes.Store(qnoteID, helperID)
+			log.Printf("[helper-note] Created answer generation helper note for Qnote %s.", qnoteID)
+		}
+	}
+
 	geminiClient, err := NewClient(ctx)
 	if err != nil {
 		return
@@ -205,12 +277,7 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 		}
 	}
 	colors := []string{"#2196f3ff", "#4caf50ff", "#ff9800ff", "#9c27b0ff"}
-	qLoc, _ := qWidget["location"].(map[string]interface{})
-	qSize, _ := qWidget["size"].(map[string]interface{})
-	qx := qLoc["x"].(float64)
-	qy := qLoc["y"].(float64)
-	qw := qSize["width"].(float64)
-	qh := qSize["height"].(float64)
+	// qLoc, qSize, qx, qy, qw, qh already extracted above for helper note
 	scale := 1.0
 	if s, ok := qWidget["scale"].(float64); ok {
 		scale = s
@@ -239,7 +306,9 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 	metaPositions := [][2]int{{1, -1}, {1, 1}, {-1, 1}, {-1, -1}} // top-right, bottom-right, bottom-left, top-left
 	answerNoteIDs := make([]string, 4)
 	metaNoteIDs := make([]string, 4)
-	// 1. Generate persona answers in parallel
+	// 1. Generate persona answers in parallel (all 4 Gemini API calls simultaneously)
+	startTime := time.Now()
+	log.Printf("[AnswerQuestion] Starting parallel generation of 4 persona answers...")
 	var ansWg sync.WaitGroup
 	ansWg.Add(4)
 	answers := make([]string, 4)
@@ -255,6 +324,8 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 		}(i, p)
 	}
 	ansWg.Wait()
+	personaAnswerDuration := time.Since(startTime)
+	log.Printf("[AnswerQuestion] Completed parallel generation of 4 persona answers in %.2f seconds", personaAnswerDuration.Seconds())
 	// 2. Create answer notes (sequential, after all answers are ready)
 	for i, p := range personas {
 		pos := answerPositions[i]
@@ -280,7 +351,9 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 		}
 		answerNoteIDs[i] = ansNoteID
 	}
-	// 3. Generate meta-answers in parallel
+	// 3. Generate meta-answers in parallel (all 4 Gemini API calls simultaneously)
+	metaStartTime := time.Now()
+	log.Printf("[AnswerQuestion] Starting parallel generation of 4 meta-answers...")
 	var metaWg sync.WaitGroup
 	metaWg.Add(4)
 	metaAnswers := make([]string, 4)
@@ -303,6 +376,8 @@ func AnswerQuestion(qnoteID string, client *canvusapi.Client, chatTokenLimit int
 		}(i, p)
 	}
 	metaWg.Wait()
+	metaAnswerDuration := time.Since(metaStartTime)
+	log.Printf("[AnswerQuestion] Completed parallel generation of 4 meta-answers in %.2f seconds", metaAnswerDuration.Seconds())
 	// 4. Create meta answer notes (sequential, after all meta-answers are ready)
 	for i, p := range personas {
 		metaPos := metaPositions[i]

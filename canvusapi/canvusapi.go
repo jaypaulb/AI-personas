@@ -134,6 +134,11 @@ func (c *Client) uploadFile(endpoint, filePath string, metadata map[string]inter
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal metadata: %w", err)
 	}
+
+	// Log the request payload
+	log.Printf("[api][uploadFile] Endpoint: %s", endpoint)
+	log.Printf("[api][uploadFile] Request metadata payload: %s", string(metadataJSON))
+
 	if err := writer.WriteField("json", string(metadataJSON)); err != nil {
 		return nil, fmt.Errorf("failed to write json field: %w", err)
 	}
@@ -152,6 +157,8 @@ func (c *Client) uploadFile(endpoint, filePath string, metadata map[string]inter
 	}
 
 	url := c.buildURL(endpoint)
+	log.Printf("[api][uploadFile] Full URL: %s", url)
+
 	req, err := http.NewRequest("POST", url, body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -160,24 +167,41 @@ func (c *Client) uploadFile(endpoint, filePath string, metadata map[string]inter
 	req.Header.Set("Private-Token", c.ApiKey)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
+	log.Printf("[api][uploadFile] Request headers: Content-Type=%s, Private-Token=***", writer.FormDataContentType())
+
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("upload request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	log.Printf("[api][uploadFile] Response status: %d", resp.StatusCode)
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("[api][uploadFile] Error response body: %s", string(bodyBytes))
 		return nil, &APIError{
 			StatusCode: resp.StatusCode,
 			Message:    string(bodyBytes),
 		}
 	}
 
+	// Read the full response body
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	log.Printf("[api][uploadFile] Response body (raw): %s", string(responseBody))
+
 	var response map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+	if err := json.Unmarshal(responseBody, &response); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
+
+	// Log the parsed response
+	responseJSON, _ := json.MarshalIndent(response, "", "  ")
+	log.Printf("[api][uploadFile] Response body (parsed): %s", string(responseJSON))
 
 	return response, nil
 }
@@ -465,6 +489,30 @@ func (c *Client) downloadFile(endpoint string, outputPath string) error {
 func (c *Client) SubscribeToWidgets(ctx context.Context) (io.ReadCloser, error) {
 	url := fmt.Sprintf("%s/api/v1/canvases/%s/widgets?subscribe", strings.TrimRight(c.Server, "/"), c.CanvasID)
 	log.Printf("[debug] Subscribing to widgets at URL: %s", url)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Private-Token", c.ApiKey)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to stream: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	return resp.Body, nil
+}
+
+// SubscribeToImage creates a subscription stream to a single image widget
+func (c *Client) SubscribeToImage(ctx context.Context, imageID string) (io.ReadCloser, error) {
+	url := fmt.Sprintf("%s/api/v1/canvases/%s/widgets/%s?subscribe", strings.TrimRight(c.Server, "/"), c.CanvasID, imageID)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {

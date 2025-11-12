@@ -27,7 +27,7 @@ func ParsePersonaNote(text string) Persona {
 		p.Role = matches[2]
 		p.Description = matches[3]
 		p.Background = matches[4]
-		p.Goals = matches[5]
+		p.Goals = GoalsString(matches[5])
 		p.Age = AgeString(matches[6])
 		p.Sex = matches[7]
 		p.Race = matches[8]
@@ -60,17 +60,22 @@ func FetchPersonasFromNotes(qnoteID string, client *canvusapi.Client) ([]Persona
 // CreatePersonas extracts business notes, generates personas, and creates persona notes and images on the canvas.
 // Returns error if any required step fails.
 func CreatePersonas(ctx context.Context, qnoteID string, client *canvusapi.Client) error {
+	log.Printf("[CreatePersonas] Starting persona creation for Qnote %s", qnoteID)
 	// Step 1: Fetch all widgets
 	widgets, err := client.GetWidgets(false)
 	if err != nil {
+		log.Printf("[CreatePersonas] ERROR: Failed to fetch widgets: %v", err)
 		return fmt.Errorf("[CreatePersonas] Failed to fetch widgets: %w", err)
 	}
+	log.Printf("[CreatePersonas] Fetched %d widgets", len(widgets))
 
 	// Use the helper to get business context and anchor
 	businessContext, personasAnchor, err := getBusinessContext(ctx, qnoteID, client)
 	if err != nil {
+		log.Printf("[CreatePersonas] ERROR: Failed to get business context or anchor: %v", err)
 		return fmt.Errorf("[CreatePersonas] Failed to get business context or anchor: %w", err)
 	}
+	log.Printf("[CreatePersonas] Business context extracted (%d chars), personas anchor found", len(businessContext))
 
 	// --- Persona existence check ---
 	existingPersonas := make(map[int]map[string]interface{}) // index -> widget
@@ -93,31 +98,40 @@ func CreatePersonas(ctx context.Context, qnoteID string, client *canvusapi.Clien
 	}
 
 	if len(existingPersonas) == 4 {
-		fmt.Printf("All 4 persona notes already exist. Using existing data.\n")
+		log.Printf("[CreatePersonas] All 4 persona notes already exist. Using existing data.")
 		personaIDs := make([]string, 4)
 		for i := 0; i < 4; i++ {
 			w := existingPersonas[i]
 			text, _ := w["text"].(string)
 			id, _ := w["id"].(string)
+			if id == "" {
+				log.Printf("[CreatePersonas] ERROR: Existing persona %d has empty ID", i+1)
+				return fmt.Errorf("[CreatePersonas] existing persona %d has empty ID", i+1)
+			}
 			personaIDs[i] = id
 			p := ParsePersonaNote(text)
-			fmt.Printf("Existing Persona: %s\n", p.Name)
+			log.Printf("[CreatePersonas] Existing Persona %d: %s (ID: %s)", i+1, p.Name, id)
 		}
 		PersonaNoteIDs.Store(qnoteID, personaIDs)
+		log.Printf("[CreatePersonas] Stored existing persona IDs for Qnote %s", qnoteID)
 		return nil
 	}
 
 	// --- Gemini persona generation for missing personas ---
+	log.Printf("[CreatePersonas] Generating personas using Gemini API...")
 	ctx2, cancel2 := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel2()
 	geminiClient, err := NewClient(ctx2)
 	if err != nil {
+		log.Printf("[CreatePersonas] ERROR: Failed to create Gemini client: %v", err)
 		return fmt.Errorf("[CreatePersonas] Failed to create Gemini client: %w", err)
 	}
 	personas, err := geminiClient.GeneratePersonas(ctx2, businessContext)
 	if err != nil {
+		log.Printf("[CreatePersonas] ERROR: Gemini persona generation failed: %v", err)
 		return fmt.Errorf("[CreatePersonas] Gemini persona generation failed: %w", err)
 	}
+	log.Printf("[CreatePersonas] Successfully generated %d personas from Gemini", len(personas))
 	// Color palette
 	colors := []string{"#2196f3ff", "#4caf50ff", "#ff9800ff", "#9c27b0ff"}
 	// Layout calculation
@@ -134,10 +148,12 @@ func CreatePersonas(ctx context.Context, qnoteID string, client *canvusapi.Clien
 	imgH := 0.10
 	var imgWg sync.WaitGroup
 	var personaIDs []string
+	var createErrors []error
 	for i := 0; i < 4; i++ {
 		if w, exists := existingPersonas[i]; exists {
 			id, _ := w["id"].(string)
 			personaIDs = append(personaIDs, id)
+			log.Printf("[CreatePersonas] Using existing persona %d (ID: %s)", i+1, id)
 			continue // Skip existing
 		}
 		p := personas[i]
@@ -163,60 +179,74 @@ func CreatePersonas(ctx context.Context, qnoteID string, client *canvusapi.Clien
 			"background_color": color,
 		}
 		noteWidget, err := client.CreateNote(noteMeta)
+		noteCreated := false
 		if err != nil {
-			fmt.Printf("[CreatePersonas] Failed to create persona note: %v\n", err)
+			log.Printf("[CreatePersonas] ERROR: Failed to create persona note %d (%s): %v", i+1, title, err)
+			createErrors = append(createErrors, fmt.Errorf("persona %d (%s): %w", i+1, title, err))
 		} else {
 			noteWidgetID, _ := noteWidget["id"].(string)
-			personaIDs = append(personaIDs, noteWidgetID)
-			fmt.Printf("[CreatePersonas] Persona note created: %s (ID: %s)\n", title, noteWidgetID)
-		}
-		// Start image generation/upload in a goroutine
-		imgWg.Add(1)
-		go func(p Persona, x, imgY, imgW, imgHpx float64, idx int, title string) {
-			defer imgWg.Done()
-			fmt.Printf("[CreatePersonas] Calling OpenAI DALL·E for persona: %s\n", title)
-			imgBytes, err := GeneratePersonaImageOpenAI(p)
-			fmt.Printf("[CreatePersonas] OpenAI DALL·E call returned for persona: %s, err: %v\n", title, err)
-			imgPath := ""
-			if err != nil {
-				fmt.Printf("[CreatePersonas] Persona image not generated: %v\n", err)
-				return
-			}
-			tmpfile, err := os.CreateTemp("", "persona_*.png")
-			if err != nil {
-				fmt.Printf("[CreatePersonas] Could not create temp file for persona image: %v\n", err)
-				return
-			}
-			imgPath = tmpfile.Name()
-			if _, err := tmpfile.Write(imgBytes); err != nil {
-				fmt.Printf("[CreatePersonas] Could not write persona image to temp file: %v\n", err)
-				tmpfile.Close()
-				os.Remove(imgPath)
-				return
-			}
-			tmpfile.Close()
-			imgMeta := map[string]interface{}{
-				"title":    title + " Headshot",
-				"location": map[string]interface{}{"x": x, "y": imgY},
-				"size":     map[string]interface{}{"width": imgW, "height": imgHpx},
-			}
-			imgWidget, err := client.CreateImage(imgPath, imgMeta)
-			if err != nil {
-				fmt.Printf("[CreatePersonas] Failed to upload persona image: %v\n", err)
+			if noteWidgetID == "" {
+				log.Printf("[CreatePersonas] ERROR: Created persona note %d but got empty ID", i+1)
+				createErrors = append(createErrors, fmt.Errorf("persona %d (%s): created but got empty ID", i+1, title))
 			} else {
-				imgWidgetID, _ := imgWidget["id"].(string)
-				fmt.Printf("[CreatePersonas] Persona image uploaded: %s (ID: %s)\n", title+" Headshot", imgWidgetID)
+				personaIDs = append(personaIDs, noteWidgetID)
+				noteCreated = true
+				log.Printf("[CreatePersonas] Successfully created persona note %d: %s (ID: %s)", i+1, title, noteWidgetID)
 			}
-			os.Remove(imgPath)
-		}(p, x, imgY, imgW, imgHpx, i, title)
+		}
+		// Start image generation/upload in a goroutine (only if note was created successfully)
+		if noteCreated {
+			imgWg.Add(1)
+			go func(p Persona, x, imgY, imgW, imgHpx float64, idx int, title string) {
+				defer imgWg.Done()
+				log.Printf("[CreatePersonas] Calling OpenAI DALL·E for persona: %s", title)
+				imgBytes, err := GeneratePersonaImageOpenAI(p)
+				if err != nil {
+					log.Printf("[CreatePersonas] Persona image not generated for %s: %v", title, err)
+					return
+				}
+				tmpfile, err := os.CreateTemp("", "persona_*.png")
+				if err != nil {
+					log.Printf("[CreatePersonas] Could not create temp file for persona image %s: %v", title, err)
+					return
+				}
+				imgPath := tmpfile.Name()
+				if _, err := tmpfile.Write(imgBytes); err != nil {
+					log.Printf("[CreatePersonas] Could not write persona image to temp file %s: %v", title, err)
+					tmpfile.Close()
+					os.Remove(imgPath)
+					return
+				}
+				tmpfile.Close()
+				imgMeta := map[string]interface{}{
+					"title":    title + " Headshot",
+					"location": map[string]interface{}{"x": x, "y": imgY},
+					"size":     map[string]interface{}{"width": imgW, "height": imgHpx},
+				}
+				imgWidget, err := client.CreateImage(imgPath, imgMeta)
+				if err != nil {
+					log.Printf("[CreatePersonas] Failed to upload persona image for %s: %v", title, err)
+				} else {
+					imgWidgetID, _ := imgWidget["id"].(string)
+					log.Printf("[CreatePersonas] Persona image uploaded: %s (ID: %s)", title+" Headshot", imgWidgetID)
+				}
+				os.Remove(imgPath)
+			}(p, x, imgY, imgW, imgHpx, i, title)
+		}
 	}
-	fmt.Printf("[CreatePersonas] Persona image generation running in background.\n")
+	log.Printf("[CreatePersonas] Persona image generation running in background for %d personas", len(personaIDs))
 	// --- end Gemini persona generation ---
 
-	// Store persona note IDs for this Qnote
-	if len(personaIDs) == 4 {
-		PersonaNoteIDs.Store(qnoteID, personaIDs)
+	// Validate that we have exactly 4 persona IDs
+	if len(personaIDs) != 4 {
+		errMsg := fmt.Sprintf("Failed to create all 4 personas. Created %d/%d. Errors: %v", len(personaIDs), 4, createErrors)
+		log.Printf("[CreatePersonas] ERROR: %s", errMsg)
+		return fmt.Errorf("[CreatePersonas] %s", errMsg)
 	}
+
+	// Store persona note IDs for this Qnote
+	PersonaNoteIDs.Store(qnoteID, personaIDs)
+	log.Printf("[CreatePersonas] Successfully created and stored all 4 persona IDs for Qnote %s", qnoteID)
 	return nil
 }
 
@@ -253,7 +283,6 @@ func getBusinessContext(ctx context.Context, qnoteID string, client *canvusapi.C
 				if titleUpper == req {
 					businessNotes = append(businessNotes, w)
 					titleMap[req] = true
-					fmt.Printf("Extracted data from Note - %s\n", req)
 				}
 			}
 		}
@@ -266,13 +295,15 @@ func getBusinessContext(ctx context.Context, qnoteID string, client *canvusapi.C
 	}
 
 	missing := false
+	var missingNotes []string
 	for _, req := range requiredTitles {
 		if !titleMap[req] {
-			fmt.Printf("Note - %s not found Aborting\n", req)
+			missingNotes = append(missingNotes, req)
 			missing = true
 		}
 	}
 	if missing {
+		log.Printf("[getBusinessContext] Missing required notes: %v", missingNotes)
 		return "", nil, fmt.Errorf("Aborting extraction due to missing notes.")
 	}
 
@@ -280,7 +311,7 @@ func getBusinessContext(ctx context.Context, qnoteID string, client *canvusapi.C
 		return "", nil, fmt.Errorf("Personas anchor not found. Aborting.")
 	}
 
-	fmt.Printf("Successfully extracted all data - parsing and compiling report for AI\n")
+	log.Printf("[getBusinessContext] Successfully extracted all %d business notes", len(businessNotes))
 	structured := struct {
 		BusinessNotes  []string               `json:"business_notes"`
 		PersonasAnchor map[string]interface{} `json:"personas_anchor"`
@@ -297,9 +328,7 @@ func getBusinessContext(ctx context.Context, qnoteID string, client *canvusapi.C
 
 	const minBusinessContextLength = 100 // Minimum useful length for business context
 	if len(strings.TrimSpace(businessContext)) < minBusinessContextLength {
-		log.Printf("Warning: Business context extracted but appears too short for AI (%d characters). Consider adding more details to your business notes.\n", len(strings.TrimSpace(businessContext)))
-	} else {
-		log.Printf("Successfully extracted all data - parsing and compiling report for AI\n")
+		log.Printf("[getBusinessContext] Warning: Business context appears too short (%d characters). Consider adding more details.", len(strings.TrimSpace(businessContext)))
 	}
 
 	return businessContext, personasAnchor, nil

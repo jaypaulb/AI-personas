@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -33,15 +34,35 @@ func (a *AgeString) UnmarshalJSON(data []byte) error {
 	return fmt.Errorf("AgeString: cannot unmarshal %s", string(data))
 }
 
+// GoalsString handles goals as either a string or an array of strings
+type GoalsString string
+
+func (g *GoalsString) UnmarshalJSON(data []byte) error {
+	// Try to unmarshal as string first
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*g = GoalsString(s)
+		return nil
+	}
+	// Try to unmarshal as array of strings
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil {
+		// Join array elements with newlines
+		*g = GoalsString(strings.Join(arr, "\n"))
+		return nil
+	}
+	return fmt.Errorf("GoalsString: cannot unmarshal %s", string(data))
+}
+
 type Persona struct {
-	Name        string    `json:"name"`
-	Role        string    `json:"role"`
-	Description string    `json:"description"`
-	Background  string    `json:"background"`
-	Goals       string    `json:"goals"`
-	Age         AgeString `json:"age"`
-	Sex         string    `json:"sex"`
-	Race        string    `json:"race"`
+	Name        string      `json:"name"`
+	Role        string      `json:"role"`
+	Description string      `json:"description"`
+	Background  string      `json:"background"`
+	Goals       GoalsString `json:"goals"`
+	Age         AgeString   `json:"age"`
+	Sex         string      `json:"sex"`
+	Race        string      `json:"race"`
 }
 
 type Client struct {
@@ -65,12 +86,20 @@ func NewClient(ctx context.Context) (*Client, error) {
 
 // GeneratePersonas calls Gemini to generate 4 personas as a JSON array
 func (c *Client) GeneratePersonas(ctx context.Context, businessContext string) ([]Persona, error) {
-	prompt := `Given the following business model context, generate exactly 4 diverse personas as a JSON array. Each persona should have the following fields: name, role, description, background, goals, age, sex, race. Respond ONLY with the JSON array, no extra text.
+	prompt := `Given the following business model context, generate exactly 4 diverse personas as a JSON array. These personas should represent POTENTIAL CLIENTS from 4 DIFFERENT MARKET SECTORS who would be interested in the products/services described. They should NOT be employees of the company, but rather external customers, buyers, or decision-makers from different industries or market segments.
+
+Each persona should have the following fields: name, role, description, background, goals, age, sex, race. The "goals" field should be an array of strings representing their key objectives related to the business context.
+
+Respond ONLY with the JSON array, no extra text.
 
 Business Context:
 ` + businessContext
 
-	model := "gemini-1.5-flash" // or your preferred model
+	// Get model from environment variable, with sensible default
+	model := os.Getenv("GEMINI_MODEL_PERSONAS")
+	if model == "" {
+		model = "gemini-2.5-flash" // Default to flash for persona generation
+	}
 
 	// Read temperature from env
 	temp := 0.7
@@ -84,6 +113,14 @@ Business Context:
 	}
 
 	resp, err := c.genai.Models.GenerateContent(ctx, model, []*genai.Content{{Parts: []*genai.Part{{Text: prompt}}}}, config)
+	if err != nil {
+		// Fallback to gemini-2.5-flash-lite if model not found
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "NOT_FOUND") {
+			log.Printf("[GeneratePersonas] Model %s not found, trying fallback gemini-2.5-flash-lite", model)
+			model = "gemini-2.5-flash-lite"
+			resp, err = c.genai.Models.GenerateContent(ctx, model, []*genai.Content{{Parts: []*genai.Part{{Text: prompt}}}}, config)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +149,7 @@ Business Context:
 func FormatPersonaNote(p Persona) string {
 	return fmt.Sprintf(
 		"🧑 Name: %s\n\n💼 Role: %s\n\n📝 Description: %s\n\n🏫 Background: %s\n\n🎯 Goals: %s\n\n🎂 Age: %s\n\n⚧ Sex: %s\n\n🌍 Race: %s",
-		p.Name, p.Role, p.Description, p.Background, p.Goals, string(p.Age), p.Sex, p.Race,
+		p.Name, p.Role, p.Description, p.Background, string(p.Goals), string(p.Age), p.Sex, p.Race,
 	)
 }
 
@@ -184,7 +221,20 @@ func (sm *SessionManager) GetOrCreateSession(ctx context.Context, persona Person
 	config := &genai.GenerateContentConfig{
 		Temperature: genai.Ptr(float32(temp)),
 	}
-	chat, err := sm.client.Chats.Create(ctx, "gemini-1.5-flash", config, nil)
+	// Get model from environment variable for chat sessions
+	model := os.Getenv("GEMINI_MODEL_CHAT")
+	if model == "" {
+		model = "gemini-2.5-flash" // Default to flash for chat sessions
+	}
+	chat, err := sm.client.Chats.Create(ctx, model, config, nil)
+	if err != nil {
+		// Fallback to gemini-2.5-flash-lite if model not found
+		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "NOT_FOUND") {
+			log.Printf("[GetOrCreateSession] Model %s not found, trying fallback gemini-2.5-flash-lite", model)
+			model = "gemini-2.5-flash-lite"
+			chat, err = sm.client.Chats.Create(ctx, model, config, nil)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
