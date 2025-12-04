@@ -31,3 +31,12 @@ Thumbs.db
 qr_remote.png
 
 /dross/
+
+# AI agent files
+agent-os/
+.claude/
+CLAUDE.md
+
+# Built binaries (not the versioned one)
+ai-personas
+ai-personas-test

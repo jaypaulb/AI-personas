@@ -14,56 +14,35 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jaypaulb/AI-personas/internal/atom"
+	"github.com/jaypaulb/AI-personas/internal/timing"
+	"github.com/jaypaulb/AI-personas/internal/types"
 	"github.com/joho/godotenv"
 	"google.golang.org/genai"
 )
 
-type AgeString string
+// HTTP client timeout for OpenAI API calls
+const openAIHTTPTimeout = 30 * time.Second
 
-func (a *AgeString) UnmarshalJSON(data []byte) error {
-	var s string
-	if err := json.Unmarshal(data, &s); err == nil {
-		*a = AgeString(s)
-		return nil
-	}
-	var n float64
-	if err := json.Unmarshal(data, &n); err == nil {
-		*a = AgeString(fmt.Sprintf("%d", int(n)))
-		return nil
-	}
-	return fmt.Errorf("AgeString: cannot unmarshal %s", string(data))
-}
+// Gemini API retry configuration
+const (
+	geminiMaxRetries     = 5
+	geminiInitialBackoff = 1 * time.Second
+	geminiMaxBackoff     = 32 * time.Second
+)
 
-// GoalsString handles goals as either a string or an array of strings
-type GoalsString string
+// OpenAI API retry configuration
+const (
+	openAIMaxRetries     = 5
+	openAIInitialBackoff = 1 * time.Second
+	openAIMaxBackoff     = 32 * time.Second
+)
 
-func (g *GoalsString) UnmarshalJSON(data []byte) error {
-	// Try to unmarshal as string first
-	var s string
-	if err := json.Unmarshal(data, &s); err == nil {
-		*g = GoalsString(s)
-		return nil
-	}
-	// Try to unmarshal as array of strings
-	var arr []string
-	if err := json.Unmarshal(data, &arr); err == nil {
-		// Join array elements with newlines
-		*g = GoalsString(strings.Join(arr, "\n"))
-		return nil
-	}
-	return fmt.Errorf("GoalsString: cannot unmarshal %s", string(data))
-}
+// httpClientWithTimeout returns an HTTP client with configured timeout
+var httpClientWithTimeout = &http.Client{Timeout: openAIHTTPTimeout}
 
-type Persona struct {
-	Name        string      `json:"name"`
-	Role        string      `json:"role"`
-	Description string      `json:"description"`
-	Background  string      `json:"background"`
-	Goals       GoalsString `json:"goals"`
-	Age         AgeString   `json:"age"`
-	Sex         string      `json:"sex"`
-	Race        string      `json:"race"`
-}
+// Persona is an alias to types.Persona for backward compatibility within this package
+type Persona = types.Persona
 
 type Client struct {
 	genai *genai.Client
@@ -82,6 +61,39 @@ func NewClient(ctx context.Context) (*Client, error) {
 		return nil, err
 	}
 	return &Client{genai: client}, nil
+}
+
+// isGeminiRateLimitError checks if an error from Gemini indicates rate limiting
+func isGeminiRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// Check for common rate limit indicators in Gemini error messages
+	return strings.Contains(errStr, "429") ||
+		strings.Contains(errStr, "RESOURCE_EXHAUSTED") ||
+		strings.Contains(errStr, "rate limit") ||
+		strings.Contains(errStr, "quota exceeded") ||
+		strings.Contains(errStr, "Too Many Requests")
+}
+
+// isGeminiRetryableError checks if an error from Gemini is transient and should be retried
+func isGeminiRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Rate limit errors are retryable
+	if isGeminiRateLimitError(err) {
+		return true
+	}
+	errStr := err.Error()
+	// Check for server errors (5xx)
+	return strings.Contains(errStr, "500") ||
+		strings.Contains(errStr, "502") ||
+		strings.Contains(errStr, "503") ||
+		strings.Contains(errStr, "504") ||
+		strings.Contains(errStr, "INTERNAL") ||
+		strings.Contains(errStr, "UNAVAILABLE")
 }
 
 // GeneratePersonas calls Gemini to generate 4 personas as a JSON array
@@ -112,31 +124,64 @@ Business Context:
 		Temperature: genai.Ptr(float32(temp)),
 	}
 
-	resp, err := c.genai.Models.GenerateContent(ctx, model, []*genai.Content{{Parts: []*genai.Part{{Text: prompt}}}}, config)
-	if err != nil {
-		// Fallback to gemini-2.5-flash-lite if model not found
-		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "NOT_FOUND") {
-			log.Printf("[GeneratePersonas] Model %s not found, trying fallback gemini-2.5-flash-lite", model)
-			model = "gemini-2.5-flash-lite"
-			resp, err = c.genai.Models.GenerateContent(ctx, model, []*genai.Content{{Parts: []*genai.Part{{Text: prompt}}}}, config)
+	// Start timing the Gemini API call
+	timer := timing.Start("gemini_generate_personas")
+	promptLen := len(prompt)
+
+	var resp *genai.GenerateContentResponse
+	var lastErr error
+
+	// Retry loop with exponential backoff for rate limits
+	for attempt := 1; attempt <= geminiMaxRetries; attempt++ {
+		resp, lastErr = c.genai.Models.GenerateContent(ctx, model, []*genai.Content{{Parts: []*genai.Part{{Text: prompt}}}}, config)
+
+		if lastErr != nil {
+			// Fallback to gemini-2.5-flash-lite if model not found (only on first attempt)
+			if attempt == 1 && (strings.Contains(lastErr.Error(), "not found") || strings.Contains(lastErr.Error(), "NOT_FOUND")) {
+				log.Printf("[GeneratePersonas] Model %s not found, trying fallback gemini-2.5-flash-lite", model)
+				model = "gemini-2.5-flash-lite"
+				resp, lastErr = c.genai.Models.GenerateContent(ctx, model, []*genai.Content{{Parts: []*genai.Part{{Text: prompt}}}}, config)
+			}
 		}
+
+		if lastErr == nil {
+			// Success
+			break
+		}
+
+		// Check if error is retryable
+		if !isGeminiRetryableError(lastErr) {
+			log.Printf("[GeneratePersonas] Non-retryable error: %v", lastErr)
+			break
+		}
+
+		if attempt == geminiMaxRetries {
+			log.Printf("[GeneratePersonas] All %d attempts failed, last error: %v", geminiMaxRetries, lastErr)
+			break
+		}
+
+		// Calculate backoff with jitter
+		backoff := atom.CalculateBackoff(attempt, geminiInitialBackoff, geminiMaxBackoff, 0.1)
+		log.Printf("[GeneratePersonas] Attempt %d/%d failed (%v), retrying in %v", attempt, geminiMaxRetries, lastErr, backoff)
+		time.Sleep(backoff)
 	}
-	if err != nil {
-		return nil, err
+
+	if lastErr != nil {
+		timing.LogOperationWithDetails(timer.Name(), timer.Duration(), false, fmt.Sprintf("model=%s prompt_len=%d", model, promptLen))
+		timer.Stop()
+		return nil, lastErr
 	}
+
+	timing.LogOperationWithDetails(timer.Name(), timer.Duration(), true, fmt.Sprintf("model=%s prompt_len=%d", model, promptLen))
+	timer.Stop()
+
 	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) == 0 {
 		return nil, fmt.Errorf("no response from Gemini")
 	}
 	jsonText := resp.Candidates[0].Content.Parts[0].Text
 
 	// Strip Markdown code block if present
-	jsonText = strings.TrimSpace(jsonText)
-	if strings.HasPrefix(jsonText, "```") {
-		jsonText = strings.TrimPrefix(jsonText, "```json")
-		jsonText = strings.TrimPrefix(jsonText, "```")
-		jsonText = strings.TrimSuffix(jsonText, "```")
-		jsonText = strings.TrimSpace(jsonText)
-	}
+	jsonText = atom.StripMarkdownCodeBlock(jsonText)
 
 	var personas []Persona
 	if err := json.Unmarshal([]byte(jsonText), &personas); err != nil {
@@ -147,10 +192,7 @@ Business Context:
 
 // FormatPersonaNote formats a persona for a Canvus note
 func FormatPersonaNote(p Persona) string {
-	return fmt.Sprintf(
-		"🧑 Name: %s\n\n💼 Role: %s\n\n📝 Description: %s\n\n🏫 Background: %s\n\n🎯 Goals: %s\n\n🎂 Age: %s\n\n⚧ Sex: %s\n\n🌍 Race: %s",
-		p.Name, p.Role, p.Description, p.Background, string(p.Goals), string(p.Age), p.Sex, p.Race,
-	)
+	return atom.FormatPersonaNote(p)
 }
 
 // PersonaSession holds a chat session and persona info
@@ -177,31 +219,7 @@ func NewSessionManager(client *genai.Client) *SessionManager {
 
 // GenerateSystemPrompt returns a detailed system prompt for a persona
 func GenerateSystemPrompt(persona Persona, businessContext string) string {
-	return fmt.Sprintf(`Assume the role of the following persona for a business focus group. You are a client or potential client of the business. You are in a general purpose focus group for the business. Here is the business outline:
-
-%s
-
-Persona:
-Name: %s
-Role: %s
-Description: %s
-Background: %s
-Goals: %s
-Age: %s
-Sex: %s
-Race: %s
-
-When asked a question or provided with some info, you must only respond as the persona assigned and in the voice of that persona. Your responses should be short and sweet and structured as if given verbally. You should not repeat the question or reiterate points from the question as this would not be natural for a conversational style interaction verbally. Do not start your answer by restating the question. Do not use phrases like 'As a persona...' or 'If I were...'. Just answer as if you are the person.`,
-		businessContext,
-		persona.Name,
-		persona.Role,
-		persona.Description,
-		persona.Background,
-		persona.Goals,
-		persona.Age,
-		persona.Sex,
-		persona.Race,
-	)
+	return atom.GenerateSystemPrompt(persona, businessContext)
 }
 
 // GetOrCreateSession returns the session for a persona, creating it if needed.
@@ -211,6 +229,10 @@ func (sm *SessionManager) GetOrCreateSession(ctx context.Context, persona Person
 	if sess, ok := sm.sessions[persona.Name]; ok {
 		return sess, nil
 	}
+
+	// Start timing session creation
+	timer := timing.Start("gemini_create_session")
+
 	// Read temperature from env
 	temp := 0.7
 	if v := os.Getenv("LLM_TEMP"); v != "" {
@@ -226,21 +248,59 @@ func (sm *SessionManager) GetOrCreateSession(ctx context.Context, persona Person
 	if model == "" {
 		model = "gemini-2.5-flash" // Default to flash for chat sessions
 	}
-	chat, err := sm.client.Chats.Create(ctx, model, config, nil)
-	if err != nil {
-		// Fallback to gemini-2.5-flash-lite if model not found
-		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "NOT_FOUND") {
-			log.Printf("[GetOrCreateSession] Model %s not found, trying fallback gemini-2.5-flash-lite", model)
-			model = "gemini-2.5-flash-lite"
-			chat, err = sm.client.Chats.Create(ctx, model, config, nil)
+
+	var chat *genai.Chat
+	var lastErr error
+
+	// Retry loop with exponential backoff for rate limits
+	for attempt := 1; attempt <= geminiMaxRetries; attempt++ {
+		chat, lastErr = sm.client.Chats.Create(ctx, model, config, nil)
+
+		if lastErr != nil {
+			// Fallback to gemini-2.5-flash-lite if model not found (only on first attempt)
+			if attempt == 1 && (strings.Contains(lastErr.Error(), "not found") || strings.Contains(lastErr.Error(), "NOT_FOUND")) {
+				log.Printf("[GetOrCreateSession] Model %s not found, trying fallback gemini-2.5-flash-lite", model)
+				model = "gemini-2.5-flash-lite"
+				chat, lastErr = sm.client.Chats.Create(ctx, model, config, nil)
+			}
 		}
+
+		if lastErr == nil {
+			// Success
+			break
+		}
+
+		// Check if error is retryable
+		if !isGeminiRetryableError(lastErr) {
+			log.Printf("[GetOrCreateSession] Non-retryable error: %v", lastErr)
+			break
+		}
+
+		if attempt == geminiMaxRetries {
+			log.Printf("[GetOrCreateSession] All %d attempts failed, last error: %v", geminiMaxRetries, lastErr)
+			break
+		}
+
+		// Calculate backoff with jitter
+		backoff := atom.CalculateBackoff(attempt, geminiInitialBackoff, geminiMaxBackoff, 0.1)
+		log.Printf("[GetOrCreateSession] Attempt %d/%d failed (%v), retrying in %v", attempt, geminiMaxRetries, lastErr, backoff)
+		time.Sleep(backoff)
 	}
-	if err != nil {
-		return nil, err
+
+	if lastErr != nil {
+		timing.LogOperationWithDetails(timer.Name(), timer.Duration(), false, fmt.Sprintf("model=%s persona=%s", model, persona.Name))
+		timer.Stop()
+		return nil, lastErr
 	}
+
 	// Inject system prompt as first message
 	systemPrompt := GenerateSystemPrompt(persona, businessContext)
+	promptLen := len(systemPrompt)
 	_, _ = chat.Send(ctx, &genai.Part{Text: systemPrompt})
+
+	timing.LogOperationWithDetails(timer.Name(), timer.Duration(), true, fmt.Sprintf("model=%s persona=%s prompt_len=%d", model, persona.Name, promptLen))
+	timer.Stop()
+
 	sess := &PersonaSession{
 		Persona: &persona,
 		Chat:    chat,
@@ -255,10 +315,49 @@ func (c *Client) AnswerQuestion(ctx context.Context, persona Persona, question s
 	if err != nil {
 		return "", err
 	}
-	resp, err := sess.Chat.Send(ctx, &genai.Part{Text: question})
-	if err != nil {
-		return "", err
+
+	// Start timing the answer generation
+	timer := timing.Start("gemini_answer_question")
+	promptLen := len(question)
+
+	var resp *genai.GenerateContentResponse
+	var lastErr error
+
+	// Retry loop with exponential backoff for rate limits
+	for attempt := 1; attempt <= geminiMaxRetries; attempt++ {
+		resp, lastErr = sess.Chat.Send(ctx, &genai.Part{Text: question})
+
+		if lastErr == nil {
+			// Success
+			break
+		}
+
+		// Check if error is retryable
+		if !isGeminiRetryableError(lastErr) {
+			log.Printf("[AnswerQuestion] Non-retryable error for persona %s: %v", persona.Name, lastErr)
+			break
+		}
+
+		if attempt == geminiMaxRetries {
+			log.Printf("[AnswerQuestion] All %d attempts failed for persona %s, last error: %v", geminiMaxRetries, persona.Name, lastErr)
+			break
+		}
+
+		// Calculate backoff with jitter
+		backoff := atom.CalculateBackoff(attempt, geminiInitialBackoff, geminiMaxBackoff, 0.1)
+		log.Printf("[AnswerQuestion] Attempt %d/%d failed for persona %s (%v), retrying in %v", attempt, geminiMaxRetries, persona.Name, lastErr, backoff)
+		time.Sleep(backoff)
 	}
+
+	if lastErr != nil {
+		timing.LogOperationWithDetails(timer.Name(), timer.Duration(), false, fmt.Sprintf("persona=%s prompt_len=%d", persona.Name, promptLen))
+		timer.Stop()
+		return "", lastErr
+	}
+
+	timing.LogOperationWithDetails(timer.Name(), timer.Duration(), true, fmt.Sprintf("persona=%s prompt_len=%d", persona.Name, promptLen))
+	timer.Stop()
+
 	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) == 0 {
 		return "", fmt.Errorf("no response from Gemini")
 	}
@@ -276,15 +375,45 @@ func (c *Client) GeneratePersonaImage(ctx context.Context, persona Persona) ([]b
 	config := &genai.GenerateContentConfig{
 		ResponseModalities: []string{"TEXT", "IMAGE"},
 	}
-	resp, err := c.genai.Models.GenerateContent(
-		ctx,
-		model,
-		[]*genai.Content{{Parts: []*genai.Part{{Text: prompt}}}},
-		config,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("Imagen image generation failed: %w", err)
+
+	var resp *genai.GenerateContentResponse
+	var lastErr error
+
+	// Retry loop with exponential backoff for rate limits
+	for attempt := 1; attempt <= geminiMaxRetries; attempt++ {
+		resp, lastErr = c.genai.Models.GenerateContent(
+			ctx,
+			model,
+			[]*genai.Content{{Parts: []*genai.Part{{Text: prompt}}}},
+			config,
+		)
+
+		if lastErr == nil {
+			// Success
+			break
+		}
+
+		// Check if error is retryable
+		if !isGeminiRetryableError(lastErr) {
+			log.Printf("[GeneratePersonaImage] Non-retryable error: %v", lastErr)
+			break
+		}
+
+		if attempt == geminiMaxRetries {
+			log.Printf("[GeneratePersonaImage] All %d attempts failed, last error: %v", geminiMaxRetries, lastErr)
+			break
+		}
+
+		// Calculate backoff with jitter
+		backoff := atom.CalculateBackoff(attempt, geminiInitialBackoff, geminiMaxBackoff, 0.1)
+		log.Printf("[GeneratePersonaImage] Attempt %d/%d failed (%v), retrying in %v", attempt, geminiMaxRetries, lastErr, backoff)
+		time.Sleep(backoff)
 	}
+
+	if lastErr != nil {
+		return nil, fmt.Errorf("Imagen image generation failed: %w", lastErr)
+	}
+
 	for _, part := range resp.Candidates[0].Content.Parts {
 		if part.InlineData != nil && len(part.InlineData.Data) > 0 {
 			return part.InlineData.Data, nil
@@ -293,7 +422,8 @@ func (c *Client) GeneratePersonaImage(ctx context.Context, persona Persona) ([]b
 	return nil, fmt.Errorf("No image data returned from Imagen.")
 }
 
-// GeneratePersonaImageOpenAI generates a persona image using OpenAI DALL·E
+// GeneratePersonaImageOpenAI generates a persona image using OpenAI DALL-E
+// Uses exponential backoff with jitter for retries on rate limits and server errors
 func GeneratePersonaImageOpenAI(persona Persona) ([]byte, error) {
 	_ = godotenv.Load("../.env") // Try parent dir for test, fallback to cwd
 	apiKey := os.Getenv("OPENAI_API_KEY")
@@ -301,6 +431,10 @@ func GeneratePersonaImageOpenAI(persona Persona) ([]byte, error) {
 		return nil, fmt.Errorf("OPENAI_API_KEY not set in environment or .env")
 	}
 	prompt := fmt.Sprintf("Business Appropriate Headshot of %s, a %s. %s, %s, %s. The headshot should be tightly cropped, centered on the face, with the full head visible and minimal chest.", persona.Name, persona.Role, persona.Age, persona.Sex, persona.Race)
+
+	// Start timing the total DALL-E operation
+	totalTimer := timing.Start("openai_dalle_total")
+
 	url := "https://api.openai.com/v1/images/generations"
 	body := map[string]interface{}{
 		"prompt": prompt,
@@ -309,43 +443,90 @@ func GeneratePersonaImageOpenAI(persona Persona) ([]byte, error) {
 	}
 	jsonBody, _ := json.Marshal(body)
 	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
+
+	for attempt := 1; attempt <= openAIMaxRetries; attempt++ {
+		// Start timing this API call attempt
+		apiTimer := timing.Start(fmt.Sprintf("openai_dalle_api_attempt_%d", attempt))
+
 		req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
 		if err != nil {
+			apiTimer.StopAndLog(false)
 			return nil, fmt.Errorf("Failed to create OpenAI request: %w", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClientWithTimeout.Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("OpenAI HTTP request failed: %w", err)
-			if attempt < 3 {
-				time.Sleep(2 * time.Second)
+			timing.LogOperationWithDetails(apiTimer.Name(), apiTimer.Duration(), false, fmt.Sprintf("error=http_request_failed attempt=%d", attempt))
+			apiTimer.Stop()
+			if attempt < openAIMaxRetries {
+				backoff := atom.CalculateBackoff(attempt, openAIInitialBackoff, openAIMaxBackoff, 0.1)
+				log.Printf("[OpenAI DALL-E] Attempt %d/%d: HTTP error, retrying in %v", attempt, openAIMaxRetries, backoff)
+				time.Sleep(backoff)
 				continue
 			}
 			break
 		}
+
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
-			lastErr = fmt.Errorf("OpenAI API server error: %s", string(respBody))
-			if attempt < 3 {
-				time.Sleep(2 * time.Second)
+
+		// Handle rate limiting (429)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			lastErr = fmt.Errorf("OpenAI API rate limit exceeded: %s", string(respBody))
+			timing.LogOperationWithDetails(apiTimer.Name(), apiTimer.Duration(), false, fmt.Sprintf("status_code=%d attempt=%d", resp.StatusCode, attempt))
+			apiTimer.Stop()
+			if attempt < openAIMaxRetries {
+				// Check for Retry-After header
+				retryAfter := atom.ParseRetryAfter(resp)
+				var backoff time.Duration
+				if retryAfter > 0 {
+					backoff = retryAfter
+					log.Printf("[OpenAI DALL-E] Attempt %d/%d: Rate limited, Retry-After header suggests %v", attempt, openAIMaxRetries, backoff)
+				} else {
+					backoff = atom.CalculateBackoff(attempt, openAIInitialBackoff, openAIMaxBackoff, 0.1)
+					log.Printf("[OpenAI DALL-E] Attempt %d/%d: Rate limited, retrying in %v", attempt, openAIMaxRetries, backoff)
+				}
+				time.Sleep(backoff)
 				continue
 			}
 			break
 		}
-		if resp.StatusCode != 200 {
-			lastErr = fmt.Errorf("OpenAI API error: %s", string(respBody))
-			// Only retry on explicit 'server_error' type
-			if bytes.Contains(respBody, []byte("server_error")) && attempt < 3 {
-				if attempt < 3 {
-					time.Sleep(2 * time.Second)
-					continue
-				}
+
+		// Handle server errors (5xx)
+		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
+			lastErr = fmt.Errorf("OpenAI API server error: %s", string(respBody))
+			timing.LogOperationWithDetails(apiTimer.Name(), apiTimer.Duration(), false, fmt.Sprintf("status_code=%d attempt=%d", resp.StatusCode, attempt))
+			apiTimer.Stop()
+			if attempt < openAIMaxRetries {
+				backoff := atom.CalculateBackoff(attempt, openAIInitialBackoff, openAIMaxBackoff, 0.1)
+				log.Printf("[OpenAI DALL-E] Attempt %d/%d: Server error %d, retrying in %v", attempt, openAIMaxRetries, resp.StatusCode, backoff)
+				time.Sleep(backoff)
+				continue
 			}
 			break
 		}
+
+		// Handle other non-success status codes
+		if resp.StatusCode != 200 {
+			lastErr = fmt.Errorf("OpenAI API error: %s", string(respBody))
+			timing.LogOperationWithDetails(apiTimer.Name(), apiTimer.Duration(), false, fmt.Sprintf("status_code=%d attempt=%d", resp.StatusCode, attempt))
+			apiTimer.Stop()
+			// Only retry on explicit 'server_error' type in response body
+			if bytes.Contains(respBody, []byte("server_error")) && attempt < openAIMaxRetries {
+				backoff := atom.CalculateBackoff(attempt, openAIInitialBackoff, openAIMaxBackoff, 0.1)
+				log.Printf("[OpenAI DALL-E] Attempt %d/%d: server_error in response, retrying in %v", attempt, openAIMaxRetries, backoff)
+				time.Sleep(backoff)
+				continue
+			}
+			// Non-retryable error
+			break
+		}
+
+		timing.LogOperationWithDetails(apiTimer.Name(), apiTimer.Duration(), true, fmt.Sprintf("status_code=%d attempt=%d", resp.StatusCode, attempt))
+		apiTimer.Stop()
+
 		var parsed struct {
 			Data []struct {
 				URL string `json:"url"`
@@ -359,19 +540,38 @@ func GeneratePersonaImageOpenAI(persona Persona) ([]byte, error) {
 			lastErr = fmt.Errorf("No image URL returned from OpenAI")
 			break
 		}
-		imgResp, err := http.Get(parsed.Data[0].URL)
+
+		// Start timing image download
+		downloadTimer := timing.Start("openai_dalle_image_download")
+
+		imgResp, err := httpClientWithTimeout.Get(parsed.Data[0].URL)
 		if err != nil {
+			timing.LogOperationWithDetails(downloadTimer.Name(), downloadTimer.Duration(), false, "error=download_failed")
+			downloadTimer.Stop()
 			lastErr = fmt.Errorf("Failed to download image: %w", err)
 			break
 		}
 		defer imgResp.Body.Close()
 		imgBytes, err := io.ReadAll(imgResp.Body)
 		if err != nil {
+			timing.LogOperationWithDetails(downloadTimer.Name(), downloadTimer.Duration(), false, "error=read_failed")
+			downloadTimer.Stop()
 			lastErr = fmt.Errorf("Failed to read image data: %w", err)
 			break
 		}
+
+		timing.LogOperationWithDetails(downloadTimer.Name(), downloadTimer.Duration(), true, fmt.Sprintf("size_bytes=%d", len(imgBytes)))
+		downloadTimer.Stop()
+
+		timing.LogOperationWithDetails(totalTimer.Name(), totalTimer.Duration(), true, fmt.Sprintf("attempts=%d", attempt))
+		totalTimer.Stop()
+
 		return imgBytes, nil
 	}
+
+	timing.LogOperationWithDetails(totalTimer.Name(), totalTimer.Duration(), false, fmt.Sprintf("error=max_retries_exceeded attempts=%d", openAIMaxRetries))
+	totalTimer.Stop()
+
 	return nil, lastErr
 }
 

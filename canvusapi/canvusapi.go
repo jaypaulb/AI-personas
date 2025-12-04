@@ -9,9 +9,27 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/jaypaulb/AI-personas/internal/atom"
+	"github.com/jaypaulb/AI-personas/internal/timing"
+)
+
+// HTTP client timeouts
+const (
+	DefaultHTTPTimeout = 30 * time.Second
+	UploadHTTPTimeout  = 60 * time.Second
+)
+
+// Retry configuration for Canvus API
+const (
+	canvusMaxRetries     = 5
+	canvusInitialBackoff = 1 * time.Second
+	canvusMaxBackoff     = 32 * time.Second
 )
 
 // Core types and interfaces at the top
@@ -38,13 +56,18 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("API error %d: %s", e.StatusCode, e.Message)
 }
 
+// IsRetryable returns true if the error is transient and should be retried
+func (e *APIError) IsRetryable() bool {
+	return atom.IsRetryableStatusCode(e.StatusCode)
+}
+
 // Core client methods
 func NewClient(server, canvasID, apiKey string) *Client {
 	return &Client{
 		Server:   server,
 		CanvasID: canvasID,
 		ApiKey:   apiKey,
-		HTTP:     &http.Client{},
+		HTTP:     &http.Client{Timeout: DefaultHTTPTimeout},
 	}
 }
 
@@ -67,56 +90,156 @@ func (c *Client) buildURL(endpoint string) string {
 		endpoint)
 }
 
+// isRetryableNetworkError checks if an error is a transient network error
+func isRetryableNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for URL errors (includes DNS, connection refused, etc.)
+	if urlErr, ok := err.(*url.Error); ok {
+		// Timeout errors are retryable
+		if urlErr.Timeout() {
+			return true
+		}
+		// Connection refused, reset, etc. are retryable
+		errStr := urlErr.Error()
+		return strings.Contains(errStr, "connection refused") ||
+			strings.Contains(errStr, "connection reset") ||
+			strings.Contains(errStr, "no such host") ||
+			strings.Contains(errStr, "network is unreachable") ||
+			strings.Contains(errStr, "i/o timeout")
+	}
+	return false
+}
+
 func (c *Client) Request(method, endpoint string, payload interface{}, out interface{}, subscribe bool) error {
-	url := c.buildURL(endpoint)
+	reqURL := c.buildURL(endpoint)
 	if subscribe {
-		if strings.Contains(url, "?") {
-			url += "&subscribe=true"
+		if strings.Contains(reqURL, "?") {
+			reqURL += "&subscribe=true"
 		} else {
-			url += "?subscribe=true"
+			reqURL += "?subscribe=true"
 		}
 	}
 
-	var body io.Reader
+	var jsonData []byte
+	var err error
 	if payload != nil {
-		jsonData, err := json.Marshal(payload)
+		jsonData, err = json.Marshal(payload)
 		if err != nil {
 			return fmt.Errorf("failed to marshal payload: %w", err)
 		}
-		body = bytes.NewReader(jsonData)
 	}
 
-	req, err := http.NewRequest(method, url, body)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
+	// Start timing the HTTP call (for total duration including retries)
+	timer := timing.Start(fmt.Sprintf("canvus_api_%s_%s", method, endpoint))
 
-	req.Header.Set("Private-Token", c.ApiKey)
-	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
+	var lastErr error
+	var lastResp *http.Response
 
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return &APIError{
-			StatusCode: resp.StatusCode,
-			Message:    string(bodyBytes),
+	for attempt := 1; attempt <= canvusMaxRetries; attempt++ {
+		// Create fresh request body for each attempt
+		var body io.Reader
+		if jsonData != nil {
+			body = bytes.NewReader(jsonData)
 		}
-	}
 
-	if out != nil {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			return fmt.Errorf("failed to decode response: %w", err)
+		req, err := http.NewRequest(method, reqURL, body)
+		if err != nil {
+			timer.StopAndLog(false)
+			return fmt.Errorf("failed to create request: %w", err)
 		}
+
+		req.Header.Set("Private-Token", c.ApiKey)
+		if payload != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("request failed: %w", err)
+
+			// Check if this is a retryable network error
+			if isRetryableNetworkError(err) && attempt < canvusMaxRetries {
+				backoff := atom.CalculateBackoff(attempt, canvusInitialBackoff, canvusMaxBackoff, 0.1)
+				log.Printf("[Canvus API] Attempt %d/%d: Network error (%v), retrying in %v", attempt, canvusMaxRetries, err, backoff)
+				time.Sleep(backoff)
+				continue
+			}
+
+			timer.StopAndLog(false)
+			return lastErr
+		}
+
+		lastResp = resp
+		success := resp.StatusCode >= 200 && resp.StatusCode < 300
+
+		if !success {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+
+			apiErr := &APIError{
+				StatusCode: resp.StatusCode,
+				Message:    string(bodyBytes),
+			}
+			lastErr = apiErr
+
+			// Check if this is a retryable error (5xx or 429)
+			if apiErr.IsRetryable() && attempt < canvusMaxRetries {
+				// Check for Retry-After header
+				retryAfter := atom.ParseRetryAfter(resp)
+				var backoff time.Duration
+				if retryAfter > 0 {
+					backoff = retryAfter
+					log.Printf("[Canvus API] Attempt %d/%d: Status %d, Retry-After header suggests %v",
+						attempt, canvusMaxRetries, resp.StatusCode, backoff)
+				} else {
+					backoff = atom.CalculateBackoff(attempt, canvusInitialBackoff, canvusMaxBackoff, 0.1)
+					log.Printf("[Canvus API] Attempt %d/%d: Status %d, retrying in %v",
+						attempt, canvusMaxRetries, resp.StatusCode, backoff)
+				}
+				time.Sleep(backoff)
+				continue
+			}
+
+			// Non-retryable error or max retries exceeded
+			timing.LogOperationWithDetails(timer.Name(), timer.Duration(), false,
+				fmt.Sprintf("status_code=%d attempts=%d", resp.StatusCode, attempt))
+			timer.Stop()
+			return apiErr
+		}
+
+		// Success - decode response if needed
+		if out != nil {
+			if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+				resp.Body.Close()
+				timer.StopAndLog(false)
+				return fmt.Errorf("failed to decode response: %w", err)
+			}
+		}
+		resp.Body.Close()
+
+		timing.LogOperationWithDetails(timer.Name(), timer.Duration(), true,
+			fmt.Sprintf("status_code=%d attempts=%d", resp.StatusCode, attempt))
+		timer.Stop()
+
+		return nil
 	}
 
-	return nil
+	// All retries exhausted
+	if lastResp != nil {
+		timing.LogOperationWithDetails(timer.Name(), timer.Duration(), false,
+			fmt.Sprintf("status_code=%d attempts=%d error=max_retries_exceeded", lastResp.StatusCode, canvusMaxRetries))
+	} else {
+		timing.LogOperationWithDetails(timer.Name(), timer.Duration(), false,
+			fmt.Sprintf("attempts=%d error=max_retries_exceeded", canvusMaxRetries))
+	}
+	timer.Stop()
+
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("request failed after %d attempts", canvusMaxRetries)
 }
 
 func (c *Client) uploadFile(endpoint, filePath string, metadata map[string]interface{}) (map[string]interface{}, error) {
@@ -156,10 +279,10 @@ func (c *Client) uploadFile(endpoint, filePath string, metadata map[string]inter
 		return nil, fmt.Errorf("failed to close writer: %w", err)
 	}
 
-	url := c.buildURL(endpoint)
-	log.Printf("[api][uploadFile] Full URL: %s", url)
+	reqURL := c.buildURL(endpoint)
+	log.Printf("[api][uploadFile] Full URL: %s", reqURL)
 
-	req, err := http.NewRequest("POST", url, body)
+	req, err := http.NewRequest("POST", reqURL, body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -169,8 +292,14 @@ func (c *Client) uploadFile(endpoint, filePath string, metadata map[string]inter
 
 	log.Printf("[api][uploadFile] Request headers: Content-Type=%s, Private-Token=***", writer.FormDataContentType())
 
-	resp, err := c.HTTP.Do(req)
+	// Start timing the HTTP upload call
+	timer := timing.Start(fmt.Sprintf("canvus_api_upload_%s", endpoint))
+
+	// Use a client with longer timeout for uploads
+	uploadClient := &http.Client{Timeout: UploadHTTPTimeout}
+	resp, err := uploadClient.Do(req)
 	if err != nil {
+		timer.StopAndLog(false)
 		return nil, fmt.Errorf("upload request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -180,6 +309,8 @@ func (c *Client) uploadFile(endpoint, filePath string, metadata map[string]inter
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		log.Printf("[api][uploadFile] Error response body: %s", string(bodyBytes))
+		timing.LogOperationWithDetails(timer.Name(), timer.Duration(), false, fmt.Sprintf("status_code=%d", resp.StatusCode))
+		timer.Stop()
 		return nil, &APIError{
 			StatusCode: resp.StatusCode,
 			Message:    string(bodyBytes),
@@ -189,6 +320,7 @@ func (c *Client) uploadFile(endpoint, filePath string, metadata map[string]inter
 	// Read the full response body
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		timer.StopAndLog(false)
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
@@ -196,12 +328,16 @@ func (c *Client) uploadFile(endpoint, filePath string, metadata map[string]inter
 
 	var response map[string]interface{}
 	if err := json.Unmarshal(responseBody, &response); err != nil {
+		timer.StopAndLog(false)
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	// Log the parsed response
 	responseJSON, _ := json.MarshalIndent(response, "", "  ")
 	log.Printf("[api][uploadFile] Response body (parsed): %s", string(responseJSON))
+
+	timing.LogOperationWithDetails(timer.Name(), timer.Duration(), true, fmt.Sprintf("status_code=%d", resp.StatusCode))
+	timer.Stop()
 
 	return response, nil
 }
@@ -465,7 +601,8 @@ func (c *Client) downloadFile(endpoint string, outputPath string) error {
 
 	req.Header.Set("Private-Token", c.ApiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	// Use client with timeout instead of http.DefaultClient
+	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to download file: %v", err)
 	}
@@ -497,7 +634,9 @@ func (c *Client) SubscribeToWidgets(ctx context.Context) (io.ReadCloser, error) 
 
 	req.Header.Set("Private-Token", c.ApiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	// Use client with timeout for initial connection, but SSE streams are long-lived
+	// so we don't set a timeout on the response body reading
+	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to stream: %w", err)
 	}
@@ -521,7 +660,8 @@ func (c *Client) SubscribeToImage(ctx context.Context, imageID string) (io.ReadC
 
 	req.Header.Set("Private-Token", c.ApiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	// Use client with timeout for initial connection
+	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to stream: %w", err)
 	}
